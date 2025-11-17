@@ -1,0 +1,403 @@
+def _astar_with_businessnew(self, cid: int, safe_map, start, goal, start_tangent=None, goal_tangent=None):
+    """
+    A* with enforced stick (贴壁) insertion. If a direct candidate fails stick checks,
+    the algorithm will backtrack along parent chain (limited steps) to find a parent voxel
+    satisfying stick constraints and insert a stick there.
+    Returns ug_path (world mm start + stick points + goal), voxel path, stick_points, curve_infos, costs.
+    """
+    import heapq, time
+    import numpy as np
+    from scipy.spatial import cKDTree
+
+    # ---------- params ----------
+    voxel_size = 4.0  # mm per voxel
+    min_wall_dist_mm = 10.0
+    max_wall_dist_mm = 20.0
+    min_stick_interval_mm = 100.0
+    max_stick_interval_mm = 200.0
+    stick_interval_fixed_mm = 0.5 * (min_stick_interval_mm + max_stick_interval_mm)
+
+    safety_margin_for_curve = 5.0  # mm
+    OBSTACLE_PENALTY_RANGE = 50.0
+    LAMBDA_OBS = 6.0
+    ALPHA_DECAY = 0.12
+    W_HEUR = 1.3
+    tangent_penalty_weight = 5.0
+    curve_cost_weight = 0.3
+
+    max_expands = 20000000
+    time_limit = 300.0
+    DEBUG_PROGRESS_EVERY = 50000
+
+    # backtrack settings: how many parent steps to search for fallback stick
+    max_backtrack_steps = int(max_stick_interval_mm / voxel_size) + 5
+
+    start_time = time.time()
+
+    safe = safe_map
+    MAX_X, MAX_Y, MAX_Z = safe.shape
+
+    obs_idx = np.argwhere(safe)
+    obs_points = obs_idx.astype(np.float64) * voxel_size
+    obstacle_tree = cKDTree(obs_points) if len(obs_points) > 0 else None
+
+    distance_field = getattr(self, "distance_field", None)
+    if distance_field is not None and distance_field.shape != safe.shape:
+        distance_field = None
+
+    def make_key(x, y, z, dir_id):
+        return int(((int(x) * int(MAX_Y) + int(y)) * int(MAX_Z) + int(z)) * 32 + (dir_id if dir_id is not None else 0))
+
+    def avail(x, y, z):
+        return (0 <= x < MAX_X and 0 <= y < MAX_Y and 0 <= z < MAX_Z)
+
+    def heuristic_vox(a, b):
+        return np.linalg.norm((np.array(a, dtype=np.float64) - np.array(b, dtype=np.float64))) * voxel_size
+
+    def query_distance_to_obstacle_vox(ix, iy, iz):
+        if distance_field is not None:
+            try:
+                return float(distance_field[int(ix), int(iy), int(iz)])
+            except Exception:
+                pass
+        if obstacle_tree is None:
+            return float("inf")
+        try:
+            world_pt = self.env.voxel_to_world_astar([ix, iy, iz])
+        except Exception:
+            world_pt = np.array([ix, iy, iz], dtype=np.float64) * voxel_size
+        d, _ = obstacle_tree.query(np.asarray(world_pt).reshape(1, -1), k=1)
+        return float(d[0])
+
+    # --- try_add_stick_point_and_make_node (with backtrack fallback) ---
+    def try_add_stick_point_and_make_node(cur_world_pos_mm, cur_dir_vec, stick_points, obstacle_tree_local,
+                                          travel_dist_mm, voxel_size_mm, cur_node, last_inserted_stick_voxel):
+        """
+        Attempt to add stick at cur_world_pos_mm. If fails, backtrack along cur_node.parent chain
+        up to max_backtrack_steps to find an acceptable voxel. If found, insert stick node there.
+        Returns: (added:bool, curve_cost:float, curve_info:dict or None, last_inserted_stick_voxel_new, parent_for_next)
+        """
+        # helper to test a world point
+        def test_and_create_at(world_pt_mm, dir_vec_candidate, travel_dist_candidate, attach_node):
+            # query
+            if obstacle_tree_local is None or len(obstacle_tree_local.data) == 0:
+                return False, 0.0, None, last_inserted_stick_voxel, cur_node
+            try:
+                d_arr, _ = obstacle_tree_local.query(np.asarray(world_pt_mm).reshape(1, -1), k=1)
+                d_near_local = float(d_arr[0])
+            except Exception:
+                return False, 0.0, None, last_inserted_stick_voxel, cur_node
+
+            if not (min_wall_dist_mm <= d_near_local <= max_wall_dist_mm):
+                return False, 0.0, None, last_inserted_stick_voxel, cur_node
+
+            last_stick_dist_mm = stick_points[-1]["travel_dist"] if stick_points else 0.0
+            dist_since_last_mm = travel_dist_candidate - last_stick_dist_mm
+            if stick_points:
+                if not (min_stick_interval_mm <= dist_since_last_mm <= max_stick_interval_mm):
+                    return False, 0.0, None, last_inserted_stick_voxel, cur_node
+            else:
+                if dist_since_last_mm < min_stick_interval_mm:
+                    return False, 0.0, None, last_inserted_stick_voxel, cur_node
+
+            # ok -> create stick record
+            sp = {"pos": np.array(world_pt_mm, dtype=np.float64).copy(),
+                  "dir": None if dir_vec_candidate is None else np.array(dir_vec_candidate, dtype=np.float64).copy(),
+                  "travel_dist": float(travel_dist_candidate)}
+            stick_points.append(sp)
+
+            # voxel pos for node
+            vx = int(round(world_pt_mm[0] / voxel_size_mm))
+            vy = int(round(world_pt_mm[1] / voxel_size_mm))
+            vz = int(round(world_pt_mm[2] / voxel_size_mm))
+            voxel_pos = (vx, vy, vz)
+
+            # if duplicate voxel as last inserted, update attach_node's travel params
+            if last_inserted_stick_voxel is not None and np.array_equal(np.array(voxel_pos), last_inserted_stick_voxel):
+                attach_node.travel_dist = travel_dist_candidate
+                attach_node.last_stick_dist = travel_dist_candidate
+                # compute curve cost
+                if len(stick_points) >= 2:
+                    prev = stick_points[-2]
+                    prev_pos_world = np.array(prev["pos"], dtype=np.float64)
+                    prev_dir_world = np.array(prev["dir"], dtype=np.float64) if prev["dir"] is not None else None
+                else:
+                    try:
+                        prev_pos_world = np.array(self.env.voxel_to_world_astar(start), dtype=np.float64)
+                    except Exception:
+                        prev_pos_world = np.array(start, dtype=np.float64) * voxel_size_mm
+                    prev_dir_world = np.array(start_tangent, dtype=np.float64) if start_tangent is not None else None
+                try:
+                    c_cost, c_info = self.compute_curve_cost(prev_pos_world, prev_dir_world,
+                                                             np.array(world_pt_mm, dtype=np.float64),
+                                                             np.array(dir_vec_candidate, dtype=np.float64) if dir_vec_candidate is not None else None,
+                                                             obstacle_tree_local, voxel_size=voxel_size_mm,
+                                                             safety_margin=safety_margin_for_curve)
+                except Exception as e:
+                    c_cost, c_info = (1e6, {"error": str(e)})
+                return True, float(c_cost), c_info, np.array(voxel_pos), attach_node
+
+            # create a new stick node attached to attach_node
+            stick_node = Node(pos=voxel_pos, parent=attach_node, dir_id=None, dir_vec=None)
+            stick_node.g = attach_node.g
+            stick_node.h = 0.0
+            stick_node.f = attach_node.f
+            stick_node.travel_dist = float(travel_dist_candidate)
+            stick_node.last_stick_dist = float(travel_dist_candidate)
+
+            # compute curve cost between prev and this
+            if len(stick_points) >= 2:
+                prev = stick_points[-2]
+                prev_pos_world = np.array(prev["pos"], dtype=np.float64)
+                prev_dir_world = np.array(prev["dir"], dtype=np.float64) if prev["dir"] is not None else None
+            else:
+                try:
+                    prev_pos_world = np.array(self.env.voxel_to_world_astar(start), dtype=np.float64)
+                except Exception:
+                    prev_pos_world = np.array(start, dtype=np.float64) * voxel_size_mm
+                prev_dir_world = np.array(start_tangent, dtype=np.float64) if start_tangent is not None else None
+
+            try:
+                c_cost, c_info = self.compute_curve_cost(prev_pos_world, prev_dir_world,
+                                                         np.array(world_pt_mm, dtype=np.float64),
+                                                         np.array(dir_vec_candidate, dtype=np.float64) if dir_vec_candidate is not None else None,
+                                                         obstacle_tree_local, voxel_size=voxel_size_mm,
+                                                         safety_margin=safety_margin_for_curve)
+            except Exception as e:
+                c_cost, c_info = (1e6, {"error": str(e)})
+
+            return True, float(c_cost), c_info, np.array(voxel_pos), stick_node
+
+        # 1) try current candidate directly
+        added, c_cost, c_info, new_last_voxel, parent_for_next = test_and_create_at(cur_world_pos_mm, cur_dir_vec, travel_dist_mm, cur_node)
+        if added:
+            return added, c_cost, c_info, new_last_voxel, parent_for_next
+
+        # 2) backtrack along parent chain to find earlier voxel that satisfies stick conditions
+        node_ptr = cur_node
+        steps = 0
+        while node_ptr is not None and steps < max_backtrack_steps:
+            # node_ptr.pos may be tuple or np.array
+            try:
+                node_vox = node_ptr.pos
+                # get world pos of that voxel (prefer env helper)
+                try:
+                    world_candidate = np.array(self.env.voxel_to_world_astar(node_vox), dtype=np.float64)
+                except Exception:
+                    world_candidate = np.array(node_vox, dtype=np.float64) * voxel_size_mm
+                # approximate travel distance candidate as node_ptr.travel_dist (may be 0 for early nodes)
+                travel_candidate = getattr(node_ptr, "travel_dist", travel_dist_mm - (steps * voxel_size_mm))
+                # attempt test/create using that attach point
+                added_bt, c_cost_bt, c_info_bt, new_last_voxel_bt, parent_for_next_bt = test_and_create_at(
+                    world_candidate, cur_dir_vec, travel_candidate, node_ptr)
+                if added_bt:
+                    return added_bt, c_cost_bt, c_info_bt, new_last_voxel_bt, parent_for_next_bt
+            except Exception:
+                pass
+            node_ptr = node_ptr.parent
+            steps += 1
+
+        # failed to find via backtrack
+        return False, 0.0, None, last_inserted_stick_voxel, cur_node
+
+    # ---------------- initialize A* ----------------
+    openh = []
+    push_count = 0
+    openg = {}
+    closed = set()
+
+    s = Node(start, parent=None, dir_id=None, dir_vec=None)
+    s.g = 0.0
+    s.h = heuristic_vox(start, goal)
+    s.f = s.h
+    s.travel_dist = 0.0
+    s.last_stick_dist = 0.0
+
+    heapq.heappush(openh, (s.f, push_count, s))
+    push_count += 1
+    openg[make_key(*start, None)] = s.f
+
+    stick_points = []
+    curve_infos = []
+    path_nodes = []
+
+    expands = 0
+    best_node = None
+    best_dist = float("inf")
+    last_inserted_stick_voxel = None
+    found_goal_node = None
+
+    # neighbor directions (reuse)
+    try:
+        unit_dirs = self.unit_vectors
+        id2dir = self.id2dir
+    except Exception:
+        id2dir = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)]
+        unit_dirs = [np.array(d, dtype=np.float64) / np.linalg.norm(d) for d in id2dir]
+
+    # --------------- main loop ---------------
+    while openh:
+        if expands >= max_expands or (time.time() - start_time) > time_limit:
+            break
+
+        _, _, cur = heapq.heappop(openh)
+        expands += 1
+
+        cx, cy, cz = cur.pos
+        state_key = make_key(cx, cy, cz, cur.dir_id)
+        if state_key in closed:
+            continue
+        closed.add(state_key)
+
+        # update best fallback node
+        dist_to_goal = heuristic_vox(cur.pos, goal)
+        if dist_to_goal < best_dist:
+            best_dist = dist_to_goal
+            best_node = cur
+
+        if expands % DEBUG_PROGRESS_EVERY == 0:
+            try:
+                open_len = len(openh)
+            except Exception:
+                open_len = -1
+            print(f"[astar] expands={expands}, open={open_len}, best_dist={best_dist:.1f}mm")
+
+        # reached exact goal?
+        if tuple(cur.pos) == tuple(goal):
+            found_goal_node = cur
+            best_node = cur
+            break
+
+        # decide stick trigger
+        need_stick = (cur.travel_dist - cur.last_stick_dist) >= stick_interval_fixed_mm
+
+        # neighbor ordering
+        goal_vec = np.array(goal, dtype=np.float64) - np.array(cur.pos, dtype=np.float64)
+        neighbor_indices = list(range(len(unit_dirs)))
+        neighbor_indices.sort(key=lambda idx: float(unit_dirs[idx].dot(goal_vec)), reverse=True)
+
+        for idx in neighbor_indices:
+            d_unit = unit_dirs[idx]
+            try:
+                d = id2dir[idx]
+            except Exception:
+                d = (int(round(d_unit[0])), int(round(d_unit[1])), int(round(d_unit[2])))
+
+            nx, ny, nz = int(cx + d[0]), int(cy + d[1]), int(cz + d[2])
+            if not avail(nx, ny, nz):
+                continue
+
+            # direction pruning
+            if cur.dir_vec is not None:
+                cos_val = float(cur.dir_vec @ d_unit)
+                if cos_val < -0.9:
+                    continue
+
+            neighbor_pos = (nx, ny, nz)
+            step_len_mm = np.linalg.norm(np.array(d, dtype=np.float64)) * voxel_size
+            travel_dist_mm = cur.travel_dist + step_len_mm
+
+            gnew = cur.g + step_len_mm
+            last_stick_dist_mm = cur.last_stick_dist
+
+            # obstacle penalty
+            d_near = query_distance_to_obstacle_vox(nx, ny, nz)
+            if np.isfinite(d_near) and d_near < OBSTACLE_PENALTY_RANGE:
+                penalty = LAMBDA_OBS * (1.0 - np.exp(-ALPHA_DECAY * (OBSTACLE_PENALTY_RANGE - d_near)))
+                gnew += penalty * (step_len_mm / voxel_size)
+
+            # tangent smoothness
+            if cur.dir_vec is not None:
+                cos_dir = float(cur.dir_vec @ d_unit)
+                gnew += tangent_penalty_weight * (1.0 - max(-1.0, min(1.0, cos_dir)))
+
+            parent_for_new = cur
+            curve_cost_added = 0.0
+
+            if need_stick and obstacle_tree is not None:
+                # compute neighbor world point
+                try:
+                    world_pt = np.array(self.env.voxel_to_world_astar(neighbor_pos), dtype=np.float64)
+                except Exception:
+                    world_pt = np.array(neighbor_pos, dtype=np.float64) * voxel_size
+
+                added, c_cost, c_info, last_inserted_stick_voxel, parent_candidate = try_add_stick_point_and_make_node(
+                    world_pt, d_unit, stick_points, obstacle_tree, travel_dist_mm, voxel_size, cur, last_inserted_stick_voxel)
+
+                if added:
+                    curve_cost_added = float(c_cost) * curve_cost_weight
+                    gnew += curve_cost_added
+                    parent_for_new = parent_candidate
+                    if c_info is not None:
+                        curve_infos.append(c_info)
+                    last_stick_dist_mm = travel_dist_mm
+
+            # domain penalties
+            try:
+                gnew += self._compute_axis_turn_penalty(cur.dir_id, idx)
+                gnew += self._compute_turn_penalty(cur.dir_id, idx)
+                if abs(d[2]) > 0:
+                    gnew += self.z_penalty
+                if cur.dir_id is not None:
+                    c = float(self.cos_table[cur.dir_id, idx])
+                    if c < 0.95:
+                        gnew += (1.0 - c) * self.turn_penalty
+            except Exception:
+                pass
+
+            hnew = heuristic_vox(neighbor_pos, goal)
+            fnew = gnew + W_HEUR * hnew
+
+            state_key = make_key(nx, ny, nz, idx)
+            if state_key not in openg or fnew < openg[state_key]:
+                node = Node(neighbor_pos, parent=parent_for_new, dir_id=idx, dir_vec=d_unit)
+                node.g = gnew
+                node.h = hnew
+                node.f = fnew
+                node.travel_dist = travel_dist_mm
+                node.last_stick_dist = last_stick_dist_mm
+                openg[state_key] = fnew
+                heapq.heappush(openh, (fnew, push_count, node))
+                push_count += 1
+
+    # post processing
+    chosen_node = found_goal_node if found_goal_node is not None else best_node
+
+    path_nodes = []
+    if chosen_node is not None:
+        node = chosen_node
+        while node is not None:
+            path_nodes.append(node.pos)
+            node = node.parent
+        path_nodes.reverse()
+
+    # build ug_path in world mm
+    ug_path = []
+    try:
+        start_world = np.array(self.env.voxel_to_world_astar(start), dtype=np.float64)
+    except Exception:
+        start_world = np.array(start, dtype=np.float64) * voxel_size
+    ug_path.append({"pos": start_world, "dir": (np.array(start_tangent, dtype=np.float64) if start_tangent is not None else None)})
+
+    for sp in stick_points:
+        ug_path.append({"pos": np.array(sp["pos"], dtype=np.float64), "dir": (np.array(sp["dir"], dtype=np.float64) if sp["dir"] is not None else None)})
+
+    try:
+        goal_world = np.array(self.env.voxel_to_world_astar(goal), dtype=np.float64)
+    except Exception:
+        goal_world = np.array(goal, dtype=np.float64) * voxel_size
+    ug_path.append({"pos": goal_world, "dir": (np.array(goal_tangent, dtype=np.float64) if goal_tangent is not None else None)})
+
+    astar_cost = chosen_node.g if chosen_node is not None else float("inf")
+    total_curve_cost = 0.0
+    final_cost = astar_cost + total_curve_cost
+
+    return {
+        "ug_path": ug_path,
+        "path": path_nodes,
+        "stick_points": stick_points,
+        "curve_infos": curve_infos,
+        "astar_cost": astar_cost,
+        "curve_cost": total_curve_cost,
+        "final_cost": final_cost
+    }
