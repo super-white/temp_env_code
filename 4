@@ -1,0 +1,166 @@
+def try_add_stick_point_and_make_node(cur_world_pos_mm, cur_dir_vec, stick_points, obstacle_tree_local,
+                                      travel_dist_mm, voxel_size_mm, cur_node, last_inserted_stick_voxel):
+    """
+    尝试在 cur_world_pos_mm 插入贴壁点；若失败则沿 parent 回溯 up to max_backtrack_steps。
+    返回:
+      (added: bool, curve_cost: float, curve_info: dict or None, new_last_inserted_voxel (ndarray or None), parent_for_next)
+    parent_for_next: 如果插入成功，返回用作新子节点 parent 的 Node（可能是创建的 stick_node，或原 attach_node）
+    """
+    # 内部 helper: 在指定 world_pt_mm 上尝试创建（不回溯）
+    def _test_and_create_at(world_pt_mm, dir_vec_candidate, travel_dist_candidate, attach_node):
+        if obstacle_tree_local is None or len(obstacle_tree_local.data) == 0:
+            return False, 0.0, None, last_inserted_stick_voxel, attach_node
+
+        try:
+            d_arr, _ = obstacle_tree_local.query(np.asarray(world_pt_mm).reshape(1, -1), k=1)
+            d_near_local = float(d_arr[0])
+        except Exception:
+            return False, 0.0, None, last_inserted_stick_voxel, attach_node
+
+        # 距离约束（mm）
+        if not (min_wall_dist_mm <= d_near_local <= max_wall_dist_mm):
+            return False, 0.0, None, last_inserted_stick_voxel, attach_node
+
+        # 与上次贴壁的间隔（mm）
+        last_stick_dist_mm = stick_points[-1]["travel_dist"] if stick_points else 0.0
+        dist_since_last_mm = travel_dist_candidate - last_stick_dist_mm
+        if stick_points:
+            if not (min_stick_interval_mm <= dist_since_last_mm <= max_stick_interval_mm):
+                return False, 0.0, None, last_inserted_stick_voxel, attach_node
+        else:
+            if dist_since_last_mm < min_stick_interval_mm:
+                return False, 0.0, None, last_inserted_stick_voxel, attach_node
+
+        # 通过检查 -> 创建 stick 记录
+        sp = {"pos": np.array(world_pt_mm, dtype=np.float64).copy(),
+              "dir": None if dir_vec_candidate is None else np.array(dir_vec_candidate, dtype=np.float64).copy(),
+              "travel_dist": float(travel_dist_candidate)}
+        stick_points.append(sp)
+
+        # voxel pos for node
+        vx = int(round(world_pt_mm[0] / voxel_size_mm))
+        vy = int(round(world_pt_mm[1] / voxel_size_mm))
+        vz = int(round(world_pt_mm[2] / voxel_size_mm))
+        voxel_pos = (vx, vy, vz)
+        voxel_pos_arr = np.array(voxel_pos, dtype=int)
+
+        # 如果与上一次插入 voxel 相同，只更新 attach_node 的 travel 参数并计算曲线代价
+        if last_inserted_stick_voxel is not None and np.array_equal(voxel_pos_arr, last_inserted_stick_voxel):
+            attach_node.travel_dist = travel_dist_candidate
+            attach_node.last_stick_dist = travel_dist_candidate
+
+            # compute curve cost between prev and this
+            if len(stick_points) >= 2:
+                prev = stick_points[-2]
+                prev_pos_world = np.array(prev["pos"], dtype=np.float64)
+                prev_dir_world = np.array(prev["dir"], dtype=np.float64) if prev["dir"] is not None else None
+            else:
+                try:
+                    prev_pos_world = np.array(self.env.voxel_to_world_astar(start), dtype=np.float64)
+                except Exception:
+                    prev_pos_world = np.array(start, dtype=np.float64) * voxel_size_mm
+                prev_dir_world = np.array(start_tangent, dtype=np.float64) if start_tangent is not None else None
+
+            try:
+                c_cost, c_info = self.compute_curve_cost(prev_pos_world, prev_dir_world,
+                                                         np.array(world_pt_mm, dtype=np.float64),
+                                                         np.array(dir_vec_candidate, dtype=np.float64) if dir_vec_candidate is not None else None,
+                                                         obstacle_tree_local, voxel_size=voxel_size_mm,
+                                                         safety_margin=safety_margin_for_curve)
+            except Exception as e:
+                c_cost, c_info = (1e6, {"error": str(e)})
+            return True, float(c_cost), c_info, voxel_pos_arr, attach_node
+
+        # 否则创建一个新的 stick_node 并 attach 到 attach_node
+        stick_node = Node(pos=voxel_pos, parent=attach_node, dir_id=None, dir_vec=None)
+        stick_node.g = attach_node.g
+        stick_node.h = 0.0
+        stick_node.f = attach_node.f
+        stick_node.travel_dist = float(travel_dist_candidate)
+        stick_node.last_stick_dist = float(travel_dist_candidate)
+
+        # compute curve cost between prev and this
+        if len(stick_points) >= 2:
+            prev = stick_points[-2]
+            prev_pos_world = np.array(prev["pos"], dtype=np.float64)
+            prev_dir_world = np.array(prev["dir"], dtype=np.float64) if prev["dir"] is not None else None
+        else:
+            try:
+                prev_pos_world = np.array(self.env.voxel_to_world_astar(start), dtype=np.float64)
+            except Exception:
+                prev_pos_world = np.array(start, dtype=np.float64) * voxel_size_mm
+            prev_dir_world = np.array(start_tangent, dtype=np.float64) if start_tangent is not None else None
+
+        try:
+            c_cost, c_info = self.compute_curve_cost(prev_pos_world, prev_dir_world,
+                                                     np.array(world_pt_mm, dtype=np.float64),
+                                                     np.array(dir_vec_candidate, dtype=np.float64) if dir_vec_candidate is not None else None,
+                                                     obstacle_tree_local, voxel_size=voxel_size_mm,
+                                                     safety_margin=safety_margin_for_curve)
+        except Exception as e:
+            c_cost, c_info = (1e6, {"error": str(e)})
+
+        return True, float(c_cost), c_info, voxel_pos_arr, stick_node
+
+    # ----- 主逻辑：先试当前点，失败则回溯父节点 up to max_backtrack_steps -----
+    # 1) 先尝试当前 candidate
+    added, c_cost, c_info, new_last_voxel, parent_for_next = _test_and_create_at(cur_world_pos_mm, cur_dir_vec, travel_dist_mm, cur_node)
+    if added:
+        return added, c_cost, c_info, new_last_voxel, parent_for_next
+
+    # 2) 回溯父节点查找
+    steps = 0
+    walker = cur_node
+    while walker is not None and steps < max_backtrack_steps:
+        # 获取 walker 的 voxel world 坐标
+        try:
+            vox = np.array(walker.pos, dtype=int)
+            candidate_world = np.array(self.env.voxel_to_world_astar(vox), dtype=np.float64)
+        except Exception:
+            candidate_world = np.array(walker.pos, dtype=np.float64) * voxel_size_mm
+
+        # 估算该 walker 的 travel_dist（我们没有精确存储每个父节点 travel，使用 walker.travel_dist 如果存在）
+        candidate_travel = float(getattr(walker, "travel_dist", travel_dist_mm - steps * voxel_size_mm))
+
+        added, c_cost, c_info, new_last_voxel, parent_for_candidate = _test_and_create_at(candidate_world, cur_dir_vec, candidate_travel, walker)
+        if added:
+            return added, c_cost, c_info, new_last_voxel, parent_for_candidate
+
+        walker = walker.parent
+        steps += 1
+
+    # 3) 回溯也没找到 -> 强制插入到最近的父节点（最后一个 walker 的 parent）
+    # 选择 best fallback = cur_node (不改变 parent)，但仍记录一个 stick（使用 cur_world_pos_mm）
+    # 这里为满足“贴壁失败也要贴上”的要求，我们做一个最轻量插入（不创建新node，只更新 cur_node）
+    sp = {"pos": np.array(cur_world_pos_mm, dtype=np.float64).copy(),
+          "dir": None if cur_dir_vec is None else np.array(cur_dir_vec, dtype=np.float64).copy(),
+          "travel_dist": float(travel_dist_mm)}
+    stick_points.append(sp)
+    # compute curve cost best-effort
+    if len(stick_points) >= 2:
+        prev = stick_points[-2]
+        prev_pos_world = np.array(prev["pos"], dtype=np.float64)
+        prev_dir_world = np.array(prev["dir"], dtype=np.float64) if prev["dir"] is not None else None
+    else:
+        try:
+            prev_pos_world = np.array(self.env.voxel_to_world_astar(start), dtype=np.float64)
+        except Exception:
+            prev_pos_world = np.array(start, dtype=np.float64) * voxel_size_mm
+        prev_dir_world = np.array(start_tangent, dtype=np.float64) if start_tangent is not None else None
+    try:
+        c_cost, c_info = self.compute_curve_cost(prev_pos_world, prev_dir_world,
+                                                 np.array(cur_world_pos_mm, dtype=np.float64),
+                                                 np.array(cur_dir_vec, dtype=np.float64) if cur_dir_vec is not None else None,
+                                                 obstacle_tree_local, voxel_size=voxel_size_mm,
+                                                 safety_margin=safety_margin_for_curve)
+    except Exception as e:
+        c_cost, c_info = (1e6, {"error": str(e)})
+
+    # update cur_node travel/last_stick so children inherit
+    cur_node.travel_dist = travel_dist_mm
+    cur_node.last_stick_dist = travel_dist_mm
+
+    # return with attach to cur_node
+    return True, float(c_cost), c_info, np.array([int(round(cur_world_pos_mm[0]/voxel_size_mm)),
+                                                 int(round(cur_world_pos_mm[1]/voxel_size_mm)),
+                                                 int(round(cur_world_pos_mm[2]/voxel_size_mm))], dtype=int), cur_node
