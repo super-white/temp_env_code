@@ -1,0 +1,211 @@
+import numpy as np
+
+def extract_waypoints_with_directions(points, min_dist=200.0, max_dist=300.0):
+    """
+    输入:
+      points: iterable of [x,y,z] (原始路径，物理坐标或体素坐标都可，保持一致)
+      min_dist, max_dist: 两个取样点之间的目标距离区间（单位与 points 同）
+    输出:
+      list of {"point": [x,y,z], "direction": [vx,vy,vz]}
+      - 第一个和最后一个点保证存在
+      - 中间点以累计距离方式选择，距离达到 min_dist 则选择，
+        若超出 max_dist 会在当前段内插值以使间隔接近 (min+max)/2
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    N = len(pts)
+    if N < 2:
+        return []
+
+    results = []
+    # 起点
+    first_point = pts[0]
+    results.append({"point": first_point.tolist(), "direction": None})
+
+    acc = 0.0
+    last_index = 0
+
+    for i in range(1, N):
+        seg = np.linalg.norm(pts[i] - pts[i - 1])
+        acc += seg
+
+        if acc >= min_dist:
+            # 决定是取当前点还是在当前段内插值
+            if acc > max_dist and seg > 1e-9:
+                # 目标放在 (min+max)/2 的位置
+                target = 0.5 * (min_dist + max_dist)
+                # 在当前段上回退 over = acc - target
+                over = acc - target
+                ratio = 1.0 - (over / seg)
+                ratio = float(np.clip(ratio, 0.0, 1.0))
+                pick = pts[i - 1] + ratio * (pts[i] - pts[i - 1])
+            else:
+                pick = pts[i]
+
+            results.append({"point": pick.tolist(), "direction": None})
+            last_index = i
+            acc = 0.0
+
+    # 末点（保证）
+    final_point = pts[-1]
+    # 如果最后一个已经是刚刚添加的点（数值上非常接近），避免重复
+    if len(results) == 0 or np.linalg.norm(np.asarray(results[-1]["point"]) - final_point) > 1e-6:
+        results.append({"point": final_point.tolist(), "direction": None})
+
+    # 重新计算方向向量（基于抽取后的点）
+    for i in range(len(results)):
+        p = np.array(results[i]["point"], dtype=np.float64)
+        if i < len(results) - 1:
+            q = np.array(results[i + 1]["point"], dtype=np.float64)
+            vec = q - p
+        else:
+            # 最后一个用与前向量（若只有两个点，则前向量 = last - prev）
+            if i - 1 >= 0:
+                p_prev = np.array(results[i - 1]["point"], dtype=np.float64)
+                vec = p - p_prev
+            else:
+                vec = np.zeros(3, dtype=np.float64)
+
+        norm = np.linalg.norm(vec)
+        if norm < 1e-9:
+            direction = np.zeros(3, dtype=np.float64)
+        else:
+            direction = vec / norm
+
+        results[i]["direction"] = direction.tolist()
+
+    return results
+
+
+def _bezier_point(P0, P1, P2, P3, t):
+    """计算单个 t 的三阶贝塞尔点"""
+    t = float(t)
+    u = 1.0 - t
+    return (u**3) * P0 + 3 * (u**2) * t * P1 + 3 * u * (t**2) * P2 + (t**3) * P3
+
+
+def bezier_curve_sample(P0, P1, V0, V1, steps=50, control_factor=0.25):
+    """
+    使用方向向量 V0/V1 为切向量方向，用控制臂长度 = dist * control_factor。
+    返回 steps 个点 (包括端点)
+    """
+    P0 = np.array(P0, dtype=np.float64)
+    P1 = np.array(P1, dtype=np.float64)
+
+    # 若向量缺失则用 P0->P1 或 P1->P0 估算
+    if V0 is None:
+        v = P1 - P0
+        norm = np.linalg.norm(v)
+        V0 = (v / (norm + 1e-12)) if norm > 1e-12 else np.array([1.0, 0.0, 0.0])
+    else:
+        V0 = np.array(V0, dtype=np.float64)
+        n0 = np.linalg.norm(V0)
+        if n0 > 1e-12:
+            V0 = V0 / n0
+        else:
+            V0 = np.array([1.0, 0.0, 0.0])
+
+    if V1 is None:
+        v = P0 - P1
+        norm = np.linalg.norm(v)
+        V1 = (v / (norm + 1e-12)) if norm > 1e-12 else np.array([-1.0, 0.0, 0.0])
+    else:
+        V1 = np.array(V1, dtype=np.float64)
+        n1 = np.linalg.norm(V1)
+        if n1 > 1e-12:
+            V1 = V1 / n1
+        else:
+            V1 = np.array([-1.0, 0.0, 0.0])
+
+    dist = np.linalg.norm(P1 - P0)
+    arm = dist * control_factor
+
+    C0 = P0 + V0 * arm
+    C1 = P1 - V1 * arm
+
+    ts = np.linspace(0.0, 1.0, steps)
+    pts = [(_bezier_point(P0, C0, C1, P1, float(t))).tolist() for t in ts]
+    return pts
+
+
+def smooth_by_bezier(path_input, steps_each=50, control_factor=0.25):
+    """
+    兼容输入格式：
+      1) dict: {"waypoints": [[x,y,z], ...], "vectors": [[vx,vy,vz], ...]}
+      2) list of dicts: [{"point":[x,y,z], "direction":[vx,vy,vz]}, ...]  (extract_waypoints_with_directions 的输出)
+      3) list of points: [[x,y,z], ...]  (此时会自动重建方向为相邻段方向)
+
+    返回:
+      list of [x,y,z] - 平滑后拼接的坐标点（仅坐标）
+    """
+    # 规范化输入到 waypoints, vectors 两个 list
+    waypoints = []
+    vectors = []
+
+    # case 1: dict with keys
+    if isinstance(path_input, dict):
+        if "waypoints" in path_input and "vectors" in path_input:
+            waypoints = [np.asarray(p, dtype=np.float64) for p in path_input["waypoints"]]
+            vectors = [np.asarray(v, dtype=np.float64) for v in path_input["vectors"]]
+        else:
+            raise ValueError("dict input must contain 'waypoints' and 'vectors' keys")
+    # case 2: list
+    elif isinstance(path_input, list):
+        if len(path_input) == 0:
+            return []
+        # if elements are dicts with 'point' key
+        if isinstance(path_input[0], dict) and "point" in path_input[0]:
+            waypoints = [np.asarray(item["point"], dtype=np.float64) for item in path_input]
+            # if direction exists use it otherwise None
+            vectors = [np.asarray(item["direction"], dtype=np.float64) if item.get("direction") is not None else None for item in path_input]
+        else:
+            # raw list of coordinates -> build directions from neighbors
+            pts = [np.asarray(p, dtype=np.float64) for p in path_input]
+            waypoints = pts
+            vectors = []
+            for i in range(len(pts)):
+                if i < len(pts) - 1:
+                    v = pts[i + 1] - pts[i]
+                else:
+                    v = pts[i] - pts[i - 1] if i - 1 >= 0 else np.array([1.0, 0.0, 0.0])
+                n = np.linalg.norm(v)
+                vectors.append((v / (n + 1e-12)).tolist() if n > 1e-12 else [1.0, 0.0, 0.0])
+            vectors = [np.asarray(v, dtype=np.float64) for v in vectors]
+    else:
+        raise ValueError("path_input must be dict or list")
+
+    # ensure vectors length = waypoints length - 1 (we need per-segment direction)
+    # We'll use vector i as the direction at waypoint i (toward i+1).
+    # If last waypoint has no corresponding vector, reuse previous vector.
+    if len(vectors) < len(waypoints):
+        # pad by repeating last vector
+        last_vec = vectors[-1] if len(vectors) > 0 else np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        while len(vectors) < len(waypoints):
+            vectors.append(last_vec)
+
+    # now build sampled path by Bezier per segment
+    sampled = []
+    for i in range(len(waypoints) - 1):
+        p0 = waypoints[i]
+        p1 = waypoints[i + 1]
+        v0 = vectors[i] if vectors[i] is not None else None
+        v1 = vectors[i + 1] if i + 1 < len(vectors) else None
+
+        # if v1 is None use v0 or compute from segment direction
+        if v1 is None:
+            seg = p1 - p0
+            n = np.linalg.norm(seg)
+            v1 = (seg / (n + 1e-12)) if n > 1e-12 else (v0 if v0 is not None else np.array([1.0, 0.0, 0.0]))
+
+        pts = bezier_curve_sample(p0, p1, v0, v1, steps=steps_each, control_factor=control_factor)
+        if i > 0:
+            # 去掉重复样本的第一个点（与前一段末点重复）
+            pts = pts[1:]
+        sampled.extend(pts)
+
+    # ensure last waypoint included
+    if len(waypoints) >= 1:
+        last_pt = waypoints[-1].tolist()
+        if len(sampled) == 0 or (np.linalg.norm(np.asarray(sampled[-1]) - np.asarray(last_pt)) > 1e-9):
+            sampled.append(last_pt)
+
+    return sampled
