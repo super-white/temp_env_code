@@ -1,0 +1,230 @@
+def _astar(self, cid: int, safe: np.ndarray,
+           start: Tuple[int, int, int], goal: Tuple[int, int, int],
+           start_tangent=None, goal_tangent=None,
+           tangent_penalty_weight=5.0, boundary_penalty_weight=5):
+
+    # ---- helper conversions ----
+    def voxel_to_world(orig_voxel):
+        """把原始体素索引(assembly voxel) -> world(mm)"""
+        return np.array(self.min_bound, dtype=np.float64) + np.array(orig_voxel, dtype=np.float64) * self.voxel_size
+
+    def world_to_planning_idx(world_pt):
+        """world(mm) -> planning grid 索引 (int 三元组)
+           if planning origin available use it; else assume planning origin == self.min_bound
+        """
+        origin = getattr(self, "planning_voxel_origin", None)
+        if origin is None:
+            origin = self.min_bound
+        idx = ((np.array(world_pt, dtype=np.float64) - np.array(origin, dtype=np.float64)) / self.voxel_size)
+        return tuple(int(round(x)) for x in idx)
+
+    def planning_idx_to_world(pl_idx):
+        origin = getattr(self, "planning_voxel_origin", None)
+        if origin is None:
+            origin = self.min_bound
+        return np.array(origin, dtype=np.float64) + np.array(pl_idx, dtype=np.float64) * self.voxel_size
+
+    def world_to_orig_voxel(world_pt):
+        idx = ((np.array(world_pt, dtype=np.float64) - np.array(self.min_bound, dtype=np.float64)) / self.voxel_size)
+        return tuple(int(round(x)) for x in idx)
+
+    # ---- small utility: segment collision check in original safe voxel space ----
+    def segment_hits_obstacle_vox(v1_pl, v2_pl, safe_arr):
+        """v1_pl/v2_pl are planning-grid indices; convert to world->orig voxel and sample line.
+           Return True if segment intersects an obstacle in original safe_arr.
+        """
+        w1 = planning_idx_to_world(v1_pl)
+        w2 = planning_idx_to_world(v2_pl)
+        p1 = np.array(w1) / self.voxel_size  # in original voxel units but fractional
+        p2 = np.array(w2) / self.voxel_size
+        dist = np.linalg.norm(p2 - p1)
+        if dist < 1e-6:
+            xi, yi, zi = map(int, np.floor(p1))
+            if 0 <= xi < safe_arr.shape[0] and 0 <= yi < safe_arr.shape[1] and 0 <= zi < safe_arr.shape[2]:
+                return not safe_arr[xi, yi, zi]
+            return True
+        steps = int(max(2, dist * 1.5))  # sampling density (1.5 samples per voxel length)
+        for t in np.linspace(0.0, 1.0, steps):
+            p = p1 * (1 - t) + p2 * t
+            xi, yi, zi = int(np.floor(p[0])), int(np.floor(p[1])), int(np.floor(p[2]))
+            if not (0 <= xi < safe_arr.shape[0] and 0 <= yi < safe_arr.shape[1] and 0 <= zi < safe_arr.shape[2]):
+                return True  # out of bounds -> treat as collision (or skip depending on desired policy)
+            if safe_arr[xi, yi, zi]:
+                return True
+        return False
+
+    # ---- begin A* on planning grid ----
+    planning_grid = getattr(self, "planning_voxel_grid", None)
+    if planning_grid is None:
+        raise RuntimeError("planning_voxel_grid not initialized on voxelization")
+
+    # convert start/goal (original voxel indices) -> planning-grid indices
+    start_pl = world_to_planning_idx(voxel_to_world(start))
+    goal_pl  = world_to_planning_idx(voxel_to_world(goal))
+
+    # bounds of planning grid
+    PG_X, PG_Y, PG_Z = planning_grid.shape
+
+    def in_planning_bounds(x, y, z):
+        return (0 <= x < PG_X and 0 <= y < PG_Y and 0 <= z < PG_Z)
+
+    # availability check: must be in planning grid, planning_grid==True (allowed area),
+    # and original safe must be free at corresponding original voxel,
+    # plus simple local segment-check against original safe to avoid crossing obstacles through gaps.
+    def avail_pl(prev_pl, cur_pl):
+        x, y, z = cur_pl
+        if not in_planning_bounds(x, y, z):
+            return False
+        # planning grid requires True == walkable (as you stored)
+        if not bool(planning_grid[x, y, z]):
+            return False
+
+        # convert planning idx -> world -> original voxel idx
+        world_pt = planning_idx_to_world(cur_pl)
+        orig_vox = world_to_orig_voxel(world_pt)
+        ox, oy, oz = orig_vox
+        if not (0 <= ox < safe.shape[0] and 0 <= oy < safe.shape[1] and 0 <= oz < safe.shape[2]):
+            return False
+        # original safe: False means free, True means occupied in your code earlier;
+        # if occupied -> cannot
+        if safe[ox, oy, oz]:
+            return False
+
+        # ensure the straight segment from prev_pl->cur_pl doesn't cross original obstacles
+        # (this prevents jumping through holes in planning grid)
+        if prev_pl is not None:
+            if segment_hits_obstacle_vox(prev_pl, cur_pl, safe):
+                return False
+
+        return True
+
+    # ---- A* data structures ----
+    import math
+    openh = []
+    push_count = 0
+    openg = {}
+    closed = set()
+
+    # Node seed: start_pl
+    s_pl = tuple(int(x) for x in start_pl)
+    gstart = 0.0
+    # heuristic: Euclidean in planning-grid * voxel_size -> mm consistent, but can use voxel units too
+    def heuristic_pl(a_pl, b_pl):
+        return math.sqrt((a_pl[0]-b_pl[0])**2 + (a_pl[1]-b_pl[1])**2 + (a_pl[2]-b_pl[2])**2) * self.voxel_size
+
+    # initial availability check
+    if not avail_pl(None, s_pl):
+        print(f"start_pl not available in planning grid or collides original: {s_pl}")
+    if not avail_pl(None, tuple(int(x) for x in goal_pl)):
+        print(f"goal_pl not available in planning grid or collides original: {goal_pl}")
+
+    # push start
+    start_node = Node(s_pl, parent=None, dir_id=None, dir_vec=None)
+    start_node.g = 0.0
+    start_node.h = heuristic_pl(s_pl, tuple(int(x) for x in goal_pl))
+    start_node.f = start_node.h
+    start_node.travel_dist = 0.0
+    start_node.last_stick_dist = 0.0
+
+    heapq.heappush(openh, (start_node.f, push_count, start_node))
+    push_count += 1
+    openg[(s_pl[0], s_pl[1], s_pl[2], None)] = start_node.f
+
+    # neighbors: use integer id2dir exactly
+    id2dir = self.id2dir  # mapping index->(dx,dy,dz)
+    unit_dirs = self.unit_vectors  # keep for turn penalties etc
+    goal_pl_t = tuple(int(x) for x in goal_pl)
+
+    while openh:
+        _, _, cur = heapq.heappop(openh)
+        cx, cy, cz = cur.pos
+        state_key = (cx, cy, cz, cur.dir_id)
+        if state_key in closed:
+            continue
+        closed.add(state_key)
+
+        # goal check
+        if (cx, cy, cz) == goal_pl_t:
+            # reconstruct path in planning indices; then convert back to original voxel indices for return
+            path_pl = []
+            node = cur
+            while node is not None:
+                path_pl.append(node.pos)
+                node = node.parent
+            path_pl.reverse()
+            # convert planning idx path -> original voxel indices for compatibility with rest of code:
+            path_orig = []
+            for p_pl in path_pl:
+                w = planning_idx_to_world(p_pl)
+                vox = world_to_orig_voxel(w)
+                path_orig.append(tuple(int(x) for x in vox))
+            # final_dir from last two original voxels (if available)
+            if len(path_orig) >= 2:
+                last = np.array(path_orig[-1], dtype=np.float64)
+                prev = np.array(path_orig[-2], dtype=np.float64)
+                vec = last - prev
+                norm = np.linalg.norm(vec)
+                final_dir = (vec / norm).tolist() if norm > 1e-6 else [0.0, 0.0, 0.0]
+            else:
+                final_dir = [0.0, 0.0, 0.0]
+            return path_orig, final_dir
+
+        # expand neighbors (integer deltas)
+        for dir_id, delta in id2dir.items():
+            dx, dy, dz = delta
+            nx, ny, nz = int(cx + dx), int(cy + dy), int(cz + dz)
+            # check planning-grid availability (includes original safe checks)
+            prev_pl = (cx, cy, cz)
+            cur_pl = (nx, ny, nz)
+            if not avail_pl(prev_pl, cur_pl):
+                continue
+
+            # direction pruning using dir_vec if present
+            d_unit = unit_dirs[dir_id]
+            if cur.dir_vec is not None:
+                cos_dir = float(cur.dir_vec @ d_unit)
+                if cos_dir < 0.25:
+                    continue
+
+            neighbor_pos = (nx, ny, nz)
+            step_len_mm = math.sqrt(dx*dx + dy*dy + dz*dz) * self.voxel_size
+            gnew = cur.g + step_len_mm
+
+            # preserve your existing penalties (use planning-grid dir_id mapping)
+            if cur.dir_vec is not None:
+                gnew += tangent_penalty_weight * (1.0 - float(cur.dir_vec @ d_unit))
+            if cur.parent is None and start_tangent is not None:
+                gnew += boundary_penalty_weight * (1.0 - (start_tangent @ d_unit))  # start_tangent in world; acceptable proxy
+            if self.is_close(neighbor_pos, goal_pl_t) and goal_tangent is not None:
+                gnew += boundary_penalty_weight * (1.0 - (goal_tangent @ d_unit))
+
+            # direction/axis/turn penalties (use your existing helpers)
+            try:
+                gnew += self._compute_axis_turn_penalty(cur.dir_id, dir_id)
+                gnew += self._compute_turn_penalty(cur.dir_id, dir_id)
+                if abs(dz) > 0:
+                    gnew += self.z_penalty
+                if cur.dir_id is not None:
+                    c = float(self.cos_table[cur.dir_id, dir_id])
+                    if c < 0.95:
+                        gnew += (1.0 - c) * self.turn_penalty
+            except Exception:
+                pass
+
+            hnew = heuristic_pl(neighbor_pos, goal_pl_t)
+            fnew = gnew + hnew
+
+            state_key2 = (nx, ny, nz, dir_id)
+            if state_key2 not in openg or fnew < openg[state_key2]:
+                node = Node(neighbor_pos, parent=cur, dir_id=dir_id, dir_vec=d_unit)
+                node.g = gnew
+                node.h = hnew
+                node.f = fnew
+                node.travel_dist = cur.travel_dist + step_len_mm
+                node.last_stick_dist = cur.last_stick_dist
+                openg[state_key2] = fnew
+                heapq.heappush(openh, (fnew, push_count, node))
+                push_count += 1
+
+    # no path found
+    return [], []
