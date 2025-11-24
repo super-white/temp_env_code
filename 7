@@ -1,0 +1,330 @@
+def _astar(self, cid: int, safe: np.ndarray,
+               start: Tuple[int, int, int], goal: Tuple[int, int, int],
+               start_tangent=None, goal_tangent=None,
+               tangent_penalty_weight=5.0, boundary_penalty_weight=5):
+
+        # --------------- 内部说明 ---------------
+        # 本实现把 A* 的“可走集合”限制到 self.planning_voxel_grid（膨胀后的栅格）上行走。
+        # - start/goal 为原始体素坐标（体素索引），和你原先调用保持一致。
+        # - 若 start/goal 未落在 planning 网格上，会吸附到最近 planning voxel（但 A* 目标判断仍以原始 goal 为准）。
+        # - 当 planning 区域不连续时，会尝试跨区域跳跃（从 planning_kdtree 取若干近邻），
+        #   跨域跳跃前用原始体素（self.voxelization.voxel_array）做直线碰撞检测（_line_collision_free）。
+        # - 节点 pos / heuristic / goal 比较使用原始体素索引（与你原来一致）。
+        # --------------- end ---------------
+
+        MAX_X, MAX_Y, MAX_Z = safe.shape
+
+        def make_key(x, y, z, dir_id):
+            return (((int(x) * MAX_Y + int(y)) * MAX_Z + int(z)) * 32 + (int(dir_id) if dir_id is not None else 0))
+
+        # ----------------- helpers -----------------
+        planning_grid = getattr(self, "planning_voxel_grid", None)
+        # planning voxel origin in world mm (fallback to voxelization.origin/min_bound)
+        planning_origin = getattr(self.voxelization, "planning_voxel_origin", None)
+        if planning_origin is None:
+            planning_origin = getattr(self.voxelization, "origin", self.min_bound)
+        planning_origin = np.asarray(planning_origin, dtype=np.float64)
+        self.planning_origin = planning_origin  # cache for downstream helpers
+
+        # original obstacle voxel (bool array) used for strict collision checks on jump lines
+        obstacle_voxel = getattr(self.voxelization, "voxel_array", None)
+        if obstacle_voxel is None:
+            # fallback to env safe array inverted if necessary
+            obstacle_voxel = np.asarray(self.env.get_safe_voxel_array(cid), dtype=bool)
+
+        # precompute planning true voxel coordinates and KDTree
+        if planning_grid is None:
+            # 如果没有 planning_grid，就退回到原逻辑（不改变你的原实现）
+            planning_true_voxels = np.zeros((0, 3), dtype=int)
+            planning_kdtree = None
+            PG_X = PG_Y = PG_Z = 0
+        else:
+            planning_true_voxels = np.argwhere(planning_grid)  # shape (M,3) indices in planning grid coords
+            PG_X, PG_Y, PG_Z = planning_grid.shape
+            if planning_true_voxels.shape[0] > 0:
+                planning_kdtree = cKDTree(planning_true_voxels)
+            else:
+                planning_kdtree = None
+
+        # convert original-voxel-index -> world(mm)
+        def orig_voxel_to_world(vox):
+            # vox may be tuple/int array in original voxel coordinates
+            v = np.asarray(vox, dtype=np.float64)
+            return np.asarray(self.voxelization.min_bound, dtype=np.float64) + v * self.voxel_size
+
+        # convert planning-index -> world(mm)
+        def planning_idx_to_world(pidx):
+            return planning_origin + np.asarray(pidx, dtype=np.float64) * self.voxel_size
+
+        # convert world(mm) -> original voxel idx (use your method)
+        def world_to_orig_voxel(worldpt):
+            # returns integer voxel idx tuple
+            return tuple(self.voxelization.convert_point_to_voxel(np.asarray(worldpt, dtype=np.float64)).astype(int))
+
+        # line collision check on original voxel grid: sample along line in original voxel coordinates
+        def _line_collision_free(orig_vox_a, orig_vox_b, sample_density=2):
+            a = np.asarray(orig_vox_a, dtype=float)
+            b = np.asarray(orig_vox_b, dtype=float)
+            diff = b - a
+            length = np.linalg.norm(diff)
+            if length <= 0.0:
+                # if single voxel, just check occupancy
+                ai = np.round(a).astype(int)
+                if np.any(ai < 0) or ai[0] >= obstacle_voxel.shape[0] or ai[1] >= obstacle_voxel.shape[1] or ai[2] >= obstacle_voxel.shape[2]:
+                    return False
+                return not bool(obstacle_voxel[ai[0], ai[1], ai[2]])
+            steps = max(2, int(length * sample_density))
+            step = diff / steps
+            p = a.copy()
+            for _ in range(steps + 1):
+                pi = np.round(p).astype(int)
+                # bounds check (out-of-bounds treat as collision)
+                if np.any(pi < 0) or pi[0] >= obstacle_voxel.shape[0] or pi[1] >= obstacle_voxel.shape[1] or pi[2] >= obstacle_voxel.shape[2]:
+                    return False
+                if obstacle_voxel[pi[0], pi[1], pi[2]]:
+                    return False
+                p += step
+            return True
+
+        # snap arbitrary original-voxel point to nearest planning voxel (returns original-voxel tuple)
+        def _snap_to_planning_voxel(orig_vox):
+            # compute world mm of the original voxel
+            world = orig_voxel_to_world(orig_vox)
+            # map into planning index space
+            pidxf = (world - planning_origin) / self.voxel_size
+            pidx = np.floor(pidxf).astype(int)
+            # quick in-bounds check
+            if planning_grid is not None and 0 <= pidx[0] < PG_X and 0 <= pidx[1] < PG_Y and 0 <= pidx[2] < PG_Z:
+                if planning_grid[pidx[0], pidx[1], pidx[2]]:
+                    # convert planning idx -> world -> original voxel
+                    w = planning_idx_to_world(pidx)
+                    return world_to_orig_voxel(w)
+
+            # else query KDTree for nearest planning voxel
+            if planning_kdtree is None:
+                # no planning voxels -> fallback to original point if free
+                return tuple(orig_vox)
+            _, idx = planning_kdtree.query(np.asarray(pidx, dtype=float), k=1)
+            nearest_p = planning_true_voxels[int(idx)]
+            w = planning_idx_to_world(nearest_p)
+            return world_to_orig_voxel(w)
+
+        # find bridge neighbors: from current original voxel, find a few planning voxels as jump targets
+        def _find_bridge_neighbors_from_orig(orig_vox, k=12):
+            if planning_kdtree is None or planning_true_voxels.shape[0] == 0:
+                return []
+            # convert orig_vox -> planning idx approx (use world mapping)
+            world = orig_voxel_to_world(orig_vox)
+            p_est = (world - planning_origin) / self.voxel_size
+            # query k nearest planning voxels
+            k = min(k, planning_true_voxels.shape[0])
+            dists, idxs = planning_kdtree.query(np.asarray(p_est, dtype=float), k=k)
+            if k == 1:
+                idxs = [idxs]
+            neighbors = []
+            for ii in np.atleast_1d(idxs):
+                target_p = planning_true_voxels[int(ii)]
+                target_world = planning_idx_to_world(target_p)
+                target_orig = world_to_orig_voxel(target_world)
+                # skip if same as current
+                if tuple(target_orig) == tuple(orig_vox):
+                    continue
+                # check line collision in original voxel space
+                if _line_collision_free(orig_vox, target_orig):
+                    neighbors.append(tuple(target_orig))
+            return neighbors
+
+        # ----------------- A* main (开始) -----------------
+        openh = []
+        openg = {}
+        closed = set()
+
+        # If planning grid exists and start not in planning, snap it (but we still treat start as original for node)
+        start_orig = tuple(map(int, start))
+        goal_orig = tuple(map(int, goal))
+
+        # optionally snap start and goal to nearest planning voxel to seed search region (but node.pos remains original voxels)
+        # we will create an initial node at start_orig as before, but we will allow its children to move to planning voxels
+        s = Node(start_orig, parent=None, dir_id=None)
+        s.g = 0.0
+        s.h = heuristic(start_orig, goal_orig)
+        s.f = s.h
+        s.travel_dist = 0.0
+        s.last_stick_dist = 0.0
+
+        heapq.heappush(openh, (s.f, 0, s))
+        openg[make_key(*start_orig, None)] = s.f
+
+        # pre-bind commonly used items from self for speed
+        unit_dirs = self.unit_vectors
+        id2dir = self.id2dir
+        cos_table = self.cos_table
+        axis_penalty = self._compute_axis_turn_penalty
+        angle_penalty = self._compute_turn_penalty
+        z_penalty = self.z_penalty
+        turn_penalty = self.turn_penalty
+        hfunc = heuristic
+
+        # keep best fallback
+        expands = 0
+        best_node = None
+        best_dist = float("inf")
+
+        # main loop
+        while openh:
+            _, _, cur = heapq.heappop(openh)
+            expands += 1
+            cx, cy, cz = cur.pos
+            key = make_key(cx, cy, cz, cur.dir_id)
+            if key in closed:
+                continue
+            closed.add(key)
+
+            # update best fallback
+            dist_to_goal = hfunc(cur.pos, goal_orig)
+            if dist_to_goal < best_dist:
+                best_dist = dist_to_goal
+                best_node = cur
+
+            # reach exact goal?
+            if tuple(cur.pos) == tuple(goal_orig):
+                # reconstruct path
+                path = []
+                node = cur
+                while node:
+                    path.append(node.pos)
+                    node = node.parent
+                path.reverse()
+                # compute final_dir similar to original
+                if len(path) >= 2:
+                    last = np.array(path[-1], dtype=np.float32)
+                    prev = np.array(path[-2], dtype=np.float32)
+                    vec = last - prev
+                    norm = np.linalg.norm(vec)
+                    final_dir = vec / norm if norm > 1e-6 else np.zeros(3, dtype=np.float32)
+                else:
+                    final_dir = np.zeros(3, dtype=np.float32)
+                return path, final_dir
+
+            # generate neighbors:
+            neighbors = []  # list of original-voxel tuples
+            # 1) try local 26 neighbors mapped through planning grid:
+            for dir_id, d_unit in enumerate(unit_dirs):
+                d = id2dir[dir_id]
+                # candidate original neighbor in original voxels (simple 3-neighbor step)
+                nx, ny, nz = int(cx + d[0]), int(cy + d[1]), int(cz + d[2])
+                # bounds
+                if nx < 0 or ny < 0 or nz < 0 or nx >= MAX_X or ny >= MAX_Y or nz >= MAX_Z:
+                    continue
+                # availability by original safe mask (you wanted original safe to be used)
+                if safe[nx, ny, nz]:
+                    continue
+
+                # Map this candidate original voxel -> world -> planning idx and check planning grid True
+                world_pt = orig_voxel_to_world((nx, ny, nz))
+                # planning idx
+                pidxf = (world_pt - planning_origin) / self.voxel_size
+                pidx = np.floor(pidxf).astype(int)
+                if planning_grid is not None and 0 <= pidx[0] < PG_X and 0 <= pidx[1] < PG_Y and 0 <= pidx[2] < PG_Z:
+                    if planning_grid[pidx[0], pidx[1], pidx[2]]:
+                        neighbors.append(((nx, ny, nz), dir_id, d_unit))
+                    else:
+                        # candidate not in planning grid -> skip for local neighbor
+                        continue
+                else:
+                    # outside planning bounds -> skip local neighbor
+                    continue
+
+            # 2) if no local planning neighbors, try bridge neighbors (cross-region jump)
+            if len(neighbors) == 0:
+                jump_neighbors = _find_bridge_neighbors_from_orig((cx, cy, cz), k=12)
+                for tgt in jump_neighbors:
+                    # compute approximate direction id by comparing vector to unit_dirs (choose best)
+                    vec = np.array(tgt, dtype=float) - np.array((cx, cy, cz), dtype=float)
+                    norm = np.linalg.norm(vec)
+                    if norm < 1e-9:
+                        continue
+                    u = vec / norm
+                    # pick the dir_id with largest dot
+                    dots = [float(np.dot(u, ud)) for ud in unit_dirs]
+                    best_dir_id = int(np.argmax(dots))
+                    neighbors.append((tgt, best_dir_id, unit_dirs[best_dir_id]))
+
+            # expand neighbors
+            for (nbr_pos, dir_id, d_unit) in neighbors:
+                nx, ny, nz = nbr_pos
+                # direction pruning (preserve your original logic)
+                if cur.dir_vec is not None:
+                    cos_dir_val = float(cur.dir_vec @ d_unit)
+                    if cos_dir_val < 0.25:
+                        continue
+
+                neighbor_pos = (int(nx), int(ny), int(nz))
+                step_len = np.linalg.norm(np.array((nx - cx, ny - cy, nz - cz), dtype=np.float64))
+                step_len_mm = step_len * self.voxel_size
+                travel_dist = cur.travel_dist + step_len_mm
+
+                # base g increment = distance (in voxel units you used 1.0; keep consistent)
+                gnew = cur.g + step_len  # keep same scale as original (original used +1 per voxel)
+                last_stick_dist = cur.last_stick_dist
+
+                # preserve your other penalties (copied from original)
+                if cur.dir_vec is not None:
+                    gnew += tangent_penalty_weight * (1 - float(cur.dir_vec @ d_unit))
+
+                if cur.parent is None and start_tangent is not None:
+                    gnew += boundary_penalty_weight * (1.0 - (float(np.asarray(start_tangent) @ d_unit)))
+
+                if self.is_close(neighbor_pos, goal_orig) and goal_tangent is not None:
+                    gnew += boundary_penalty_weight * (1.0 - (float(np.asarray(goal_tangent) @ d_unit)))
+
+                if goal_tangent is not None:
+                    dist = abs(goal_orig[0] - nx) + abs(goal_orig[1] - ny) + abs(goal_orig[2] - nz)
+                    if dist < 8:
+                        gnew += boundary_penalty_weight * (1.0 - (float(np.asarray(goal_tangent) @ d_unit))) * (8 - dist) / 8
+
+                gnew += axis_penalty(cur.dir_id, dir_id)
+                gnew += angle_penalty(cur.dir_id, dir_id)
+
+                if abs(d_unit[2]) > 0:
+                    gnew += z_penalty
+
+                if cur.dir_id is not None:
+                    c = cos_table[cur.dir_id, dir_id]
+                    if c < 0.95:
+                        gnew += (1.0 - c) * turn_penalty
+
+                hnew = hfunc(neighbor_pos, goal_orig)
+                fnew = gnew + hnew
+
+                state_key = make_key(nx, ny, nz, dir_id)
+                if state_key not in openg or fnew < openg[state_key]:
+                    node = Node(neighbor_pos, parent=cur, dir_id=dir_id, dir_vec=d_unit)
+                    node.g = gnew
+                    node.h = hnew
+                    node.f = fnew
+                    node.travel_dist = travel_dist
+                    node.last_stick_dist = last_stick_dist
+                    openg[state_key] = fnew
+                    heapq.heappush(openh, (fnew, np.random.rand(), node))  # second key just to break ties
+
+        # exited loop: return fallback best_node if any
+        if best_node is not None:
+            path = []
+            node = best_node
+            while node:
+                path.append(node.pos)
+                node = node.parent
+            path.reverse()
+            # compute final_dir
+            if len(path) >= 2:
+                last = np.array(path[-1], dtype=np.float32)
+                prev = np.array(path[-2], dtype=np.float32)
+                vec = last - prev
+                norm = np.linalg.norm(vec)
+                final_dir = vec / norm if norm > 1e-6 else np.zeros(3, dtype=np.float32)
+            else:
+                final_dir = np.zeros(3, dtype=np.float32)
+            return path, final_dir
+
+        return [], np.zeros(3, dtype=np.float32)
