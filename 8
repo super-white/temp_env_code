@@ -1,0 +1,179 @@
+def _astar(self, cid: int, safe: np.ndarray,
+           start: Tuple[int, int, int], goal: Tuple[int, int, int],
+           start_tangent=None, goal_tangent=None,
+           tangent_penalty_weight=5.0, boundary_penalty_weight=5):
+
+    MAX_X, MAX_Y, MAX_Z = safe.shape
+
+    def make_key(x, y, z, dir_id):
+        return (((x * MAX_Y + y) * MAX_Z + z) * 32 + (dir_id if dir_id is not None else 0))
+
+    openh = []
+    openg = {}
+    closed = set()
+
+    s = Node(start, parent=None, dir_id=None)
+    s.g = 0.0
+    s.h = heuristic(start, goal)
+    s.f = s.h
+    heapq.heappush(openh, (s.f, s))
+    openg[make_key(*start, None)] = s.f
+
+    safe = self.env.get_safe_voxel_array(cid)
+    shape = safe.shape
+
+    # --------- planning grid metadata -----------
+    planning_grid = getattr(self, "planning_voxel_grid", None)
+    planning_min_index = getattr(self, "planning_voxel_grid_min_index", None)
+    planning_origin_world = getattr(self, "planning_voxel_grid_origin_world", None)
+
+    if planning_grid is not None:
+        planning_true_voxels = np.argwhere(planning_grid)
+        planning_kdtree = cKDTree(planning_true_voxels) if len(planning_true_voxels) > 0 else None
+    else:
+        planning_kdtree = None
+
+    def planning_idx_to_world(pidx):
+        p = np.asarray(pidx, dtype=float)
+        return planning_origin_world + (planning_min_index + p) * self.voxel_size
+
+    def world_to_orig_voxel(world_pt):
+        return tuple(self.voxelization.convert_point_to_voxel(np.asarray(world_pt, dtype=float)).astype(int))
+
+    def orig_voxel_to_world(orig_vox):
+        return np.asarray(self.voxelization.min_bound, dtype=float) + np.asarray(orig_vox, dtype=float) * self.voxel_size
+
+    def line_collision_free(orig_a, orig_b, obstacle_voxel):
+        a_w = orig_voxel_to_world(orig_a)
+        b_w = orig_voxel_to_world(orig_b)
+        vec = b_w - a_w
+        L = np.linalg.norm(vec)
+        if L <= 0:
+            ai = np.round(orig_a).astype(int)
+            if (ai < 0).any() or ai[0] >= obstacle_voxel.shape[0] or ai[1] >= obstacle_voxel.shape[1] or ai[2] >= obstacle_voxel.shape[2]:
+                return False
+            return not bool(obstacle_voxel[ai[0], ai[1], ai[2]])
+        steps = max(2, int(L / (self.voxel_size * 0.5)))
+        for t in np.linspace(0.0, 1.0, steps + 1):
+            p = a_w + t * vec
+            pi = np.asarray(self.voxelization.convert_point_to_voxel(p), dtype=int)
+            if (pi < 0).any() or pi[0] >= obstacle_voxel.shape[0] or pi[1] >= obstacle_voxel.shape[1] or pi[2] >= obstacle_voxel.shape[2]:
+                return False
+            if obstacle_voxel[pi[0], pi[1], pi[2]]:
+                return False
+        return True
+
+    def avail(x, y, z):
+        x, y, z = int(x), int(y), int(z)
+        if not (0 <= x < shape[0] and 0 <= y < shape[1] and 0 <= z < shape[2]):
+            return False
+        if safe[x, y, z]:
+            return False
+        return True
+
+    if not avail(*start):
+        print(f"起点不满足避障: {start}")
+    if not avail(*goal):
+        print(f"终点不满足避障: {goal}")
+
+    unit_dirs = self.unit_vectors
+    id2dir = self.id2dir
+    cos_table = self.cos_table
+    axis_penalty = self._compute_axis_turn_penalty
+    angle_penalty = self._compute_turn_penalty
+    z_penalty = self.z_penalty
+    turn_penalty = self.turn_penalty
+    min_cos_threshold = 0.25
+
+    # --------- 起点/终点接入 planning 区域 ---------
+    def find_nearest_planning_voxel(pt):
+        if planning_kdtree is None:
+            return []
+        # 将 world 转为 planning index
+        idx_est = (np.array(pt) - planning_origin_world) / self.voxel_size - planning_min_index
+        idx_est = np.round(idx_est).astype(int)
+        # 查找最近几个 planning voxel
+        dist, ids = planning_kdtree.query(idx_est, k=min(5, len(planning_true_voxels)))
+        if np.isscalar(ids):
+            ids = [ids]
+        candidates = []
+        for i in ids:
+            pidx = planning_true_voxels[i]
+            world_candidate = planning_idx_to_world(pidx)
+            orig_candidate = np.array(world_to_orig_voxel(world_candidate))
+            if line_collision_free(world_to_orig_voxel(pt), orig_candidate, safe):
+                candidates.append(tuple(pidx))
+        return candidates
+
+    start_candidates = find_nearest_planning_voxel(start)
+    goal_candidates = find_nearest_planning_voxel(goal)
+    if len(start_candidates) == 0:
+        start_candidates = [tuple(start)]
+    if len(goal_candidates) == 0:
+        goal_candidates = [tuple(goal)]
+
+    # --------- A* 循环 ---------
+    while openh:
+        _, cur = heapq.heappop(openh)
+        cx, cy, cz = cur.pos
+        key = make_key(cx, cy, cz, cur.dir_id)
+        if key in closed:
+            continue
+
+        # 检查是否到 goal（允许与 goal_candidates 中任意一个 voxel 连接）
+        if any(cur.pos == g for g in goal_candidates):
+            path = []
+            node = cur
+            while node:
+                path.append(node.pos)
+                node = node.parent
+            path.reverse()
+            return path, np.zeros(3, dtype=float)
+
+        closed.add(key)
+
+        for dir_id, d_unit in enumerate(unit_dirs):
+            d = id2dir[dir_id]
+            nx, ny, nz = cx + d[0], cy + d[1], cz + d[2]
+            neighbor_pos = (nx, ny, nz)
+            if not avail(nx, ny, nz):
+                continue
+
+            if cur.dir_vec is not None:
+                cos_dir = cur.dir_vec @ d_unit
+                if cos_dir < min_cos_threshold:
+                    continue
+
+            gnew = cur.g + 1.0
+            if cur.dir_vec is not None:
+                gnew += tangent_penalty_weight * (1 - cos_dir)
+
+            if cur.parent is None and start_tangent is not None:
+                gnew += boundary_penalty_weight * (1.0 - (start_tangent @ d_unit))
+
+            if self.is_close(neighbor_pos, goal) and goal_tangent is not None:
+                gnew += boundary_penalty_weight * (1.0 - (goal_tangent @ d_unit))
+
+            gnew += axis_penalty(cur.dir_id, dir_id)
+            gnew += angle_penalty(cur.dir_id, dir_id)
+
+            if abs(d[2]) > 0:
+                gnew += z_penalty
+
+            if cur.dir_id is not None:
+                c = cos_table[cur.dir_id, dir_id]
+                if c < 0.95:
+                    gnew += (1.0 - c) * turn_penalty
+
+            hnew = heuristic(neighbor_pos, goal)
+            fnew = gnew + hnew
+
+            state_key = make_key(nx, ny, nz, dir_id)
+            if state_key not in openg or fnew < openg[state_key]:
+                node = Node(neighbor_pos, parent=cur, dir_id=dir_id, dir_vec=d_unit)
+                node.g, node.h, node.f = gnew, hnew, fnew
+                openg[state_key] = fnew
+                heapq.heappush(openh, (fnew, node))
+
+    # 如果找不到路径，返回空
+    return []
