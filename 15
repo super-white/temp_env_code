@@ -1,0 +1,451 @@
+import threading
+from typing import List, Dict, Tuple, Optional
+
+import open3d as o3d
+import numpy as np
+from numba import njit
+
+from scipy.spatial import cKDTree
+import heapq
+
+from domain.shared_space_environment.voxel_environment_manager import VoxelEnvironmentManager
+from domain.voxelization.voxelization import Voxelization
+from infrastructure.monitor.exeution_monitor import ExecutionMonitor
+from infrastructure.logging.logger import logger
+from infrastructure.persistence.json_repository import JsonRepository
+from domain.model.node import Node
+
+
+@njit(fastmath=True)
+def heuristic(a, b):
+    return np.sqrt(np.sum((np.array(a) - np.array(b)) ** 2))
+
+
+class AstarCablePlanner:
+    def __init__(self, voxel_env: VoxelEnvironmentManager, voxelization: Voxelization, points=None,
+                 turn_penalty: float = 0.5, voxel_size: float = 4.0):
+        self.env = voxel_env
+        self.voxelization = voxelization
+        self.min_bound = self.voxelization.min_bound
+        self.planning_voxel_grid = voxelization.planning_voxel_grid
+        self.points = points
+        self.turn_penalty = turn_penalty
+        self.z_penalty = 1.3
+        self.x_penalty = 0
+        self.y_penalty = 0
+        self.turn_penalty = turn_penalty  # 原有转向惩罚
+        self.dir_penalty = 0.3  # 新增方向惩罚权重
+        self.z_penalty = 0.7
+        self.voxel_size = voxel_size
+        self.offset_mm = 6  # 偏移距离，单位mm
+
+        # 支持 26 向邻居以增加灵活性
+        self._dirs26 = [
+            (dx, dy, dz)
+            for dx in [-1, 0, 1]
+            for dy in [-1, 0, 1]
+            for dz in [-1, 0, 1]
+            if not (dx == dy == dz == 0)
+        ]
+        # 单位归一化方向（只初始化一次即可）
+        vectors = np.array(self._dirs26, dtype=np.float32)
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        self.unit_vectors = vectors / norms
+
+        self.id2dir = {i: d for i, d in enumerate(self._dirs26)}
+        self.dir2id = {d: i for i, d in enumerate(self._dirs26)}
+
+        # 余弦查表、轴表
+        self.cos_table = np.dot(self.unit_vectors, self.unit_vectors.T).astype(np.float32)
+        self.axis_table = np.array([
+            0 if dx != 0 else 1 if dy != 0 else 2
+            for dx, dy, dz in self._dirs26
+        ], dtype=np.uint8)
+
+        self._lock = threading.Lock()
+        self.monitor = ExecutionMonitor()
+
+    def visualize_safe_and_planning(self, safe: np.ndarray, planning_grid: np.ndarray, voxel_size=6.0,
+                                    highlight_point: Optional[Tuple[int, int, int]] = None):
+        """
+        可视化 safe 栅格和 A* planning 栅格
+        safe: bool array, True=障碍
+        planning_grid: bool array, True=可走
+        voxel_size: 每个 voxel 尺寸
+        highlight_point: 索引点 (x,y,z)，将以球体在图中显示
+        """
+        safe_voxels = np.argwhere(safe)  # safe 为 True 的体素
+        planning_voxels = np.argwhere(planning_grid)  # A* 可走体素
+
+        # safe voxel -> 红色
+        safe_pcd = o3d.geometry.PointCloud()
+        safe_pcd.points = o3d.utility.Vector3dVector(safe_voxels * voxel_size)
+        safe_pcd.paint_uniform_color([1, 0, 0])  # 红色
+
+        # planning voxel -> 绿色
+        planning_pcd = o3d.geometry.PointCloud()
+        planning_pcd.points = o3d.utility.Vector3dVector(planning_voxels * voxel_size)
+        planning_pcd.paint_uniform_color([0, 1, 0])  # 绿色
+
+        vis_list = [safe_pcd, planning_pcd]
+
+        # 添加高亮点（索引单位）
+        if highlight_point is not None:
+            highlight_point = np.array(highlight_point, dtype=float)
+            mesh_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=voxel_size * 0.5)
+            mesh_sphere.translate(highlight_point * voxel_size)
+            mesh_sphere.paint_uniform_color([0, 0, 1])  # 蓝色
+            vis_list.append(mesh_sphere)
+
+        o3d.visualization.draw_geometries(vis_list)
+
+    def plan_all(self, cable_config: Dict) -> Dict[int, Tuple[List[Tuple[float, float, float]], List, List]]:
+        results = {}
+        cid = cable_config['cable_id']
+        logger.debug(f"[Line 1/1] 开始规划线束 -> {cid}")
+        res = self._plan_one(cable_config)
+        results[cid] = res
+        return results
+
+    def _plan_one(self, cfg: Dict):
+        cid = cfg['cable_id']
+        print(f"当前处理线束 -> {cfg}")
+        start = np.array(cfg['start'], dtype=float)
+        goal = np.array(cfg['goal'], dtype=float)
+        safe_map = self.env.get_safe_voxel_array(cid)
+
+        self.monitor.start()
+        a = start
+        b = goal
+        print(f"当前处理线束段,线束id -> {cid},起点 -> {a},终点 ->  {b}")
+
+        a_nor = cfg.get('start_normal', None)
+        b_nor = cfg.get('goal_normal', None)
+
+        # 可视化（可选）
+        try:
+            if hasattr(self, "planning_voxel_grid") and self.planning_voxel_grid is not None:
+                self.visualize_safe_and_planning(safe_map, self.planning_voxel_grid, self.voxel_size, tuple(a))
+        except Exception:
+            pass
+
+        monitor = ExecutionMonitor("A*旧版路径规划任务")
+        monitor.start()
+        path, final_dir = self._astar(cid, safe_map, tuple(a.astype(int)), tuple(b.astype(int)), a_nor, b_nor)
+        monitor.stop()
+        print(f'路径规划返回结果： ')
+
+        repo = JsonRepository(base_dir="D:/pyEnv/Dev/ai_cabling/ug_cabling/output/astar_logs")
+        # repo.save(path, "route_002.json")
+        try:
+            repo.save(path, "old_astar_path.json")
+        except Exception:
+            pass
+        return path, final_dir
+
+    def is_close(self, pos1, pos2, tol=1.5):
+        return np.linalg.norm(np.array(pos1) - np.array(pos2)) < tol
+
+    def _bezier_point(self, P0, P1, P2, P3, t):
+        """Cubic Bezier point at t"""
+        u = 1 - t
+        return (u ** 3) * P0 + 3 * (u ** 2) * t * P1 + 3 * u * (t ** 2) * P2 + (t ** 3) * P3
+
+    def _bezier_derivatives(self, P0, P1, P2, P3, t):
+        """Return first and second derivatives r'(t), r''(t)"""
+        u = 1 - t
+        r1 = 3 * ((P1 - P0) * (u ** 2) + 2 * (P2 - P1) * (u * t) + (P3 - P2) * (t ** 2))
+        r2 = 6 * ((P2 - 2 * P1 + P0) * u + (P3 - 2 * P2 + P1) * t)
+        return r1, r2
+
+    def _compute_turn_penalty(self, prev_dir_id: int, curr_dir_id: int) -> float:
+        if prev_dir_id is None:
+            return 0.0
+        cos_sim = self.cos_table[prev_dir_id, curr_dir_id]
+        return 0.0 if cos_sim >= 0.95 else (1.0 - cos_sim) * self.turn_penalty
+
+    def _compute_axis_turn_penalty(self, prev_dir_id: int, curr_dir_id: int) -> float:
+        if prev_dir_id is None:
+            return 0.0
+        if self.axis_table[prev_dir_id] != self.axis_table[curr_dir_id]:
+            return self.turn_penalty
+        return 0.0
+
+    def _astar(self, cid: int, safe: np.ndarray,
+               start: Tuple[int, int, int], goal: Tuple[int, int, int],
+               start_tangent=None, goal_tangent=None,
+               tangent_penalty_weight: float = 5.0, boundary_penalty_weight: float = 5,
+               max_extend_steps: int = 5, kdtree_max_dist: float = 20.0):
+        """
+        A* 主函数（保持原始逻辑）
+        - start, goal: 以体素索引为单位传入（你的调用代码中已按此传入）
+        - safe: 原始 safe voxel array（True 表示障碍）
+        - planning grid: self.planning_voxel_grid（True 表示 A* 可走 膨胀区域）
+        """
+
+        MAX_X, MAX_Y, MAX_Z = safe.shape
+
+        def make_key(x, y, z, dir_id):
+            return (((int(x) * MAX_Y + int(y)) * MAX_Z + int(z)) * 32 + (int(dir_id) if dir_id is not None else 0))
+
+        openh = []
+        openg = {}
+        closed = set()
+
+        # start node
+        s = Node(start, parent=None, dir_id=None)
+        s.dir_vec = start_tangent
+        s.g = 0.0
+        s.h = heuristic(start, goal)
+        s.f = s.h
+        heapq.heappush(openh, (s.f, s))
+        openg[make_key(*start, None)] = s.f
+
+        planning_grid = getattr(self, "planning_voxel_grid", None)
+        # planning_min_index: we align to original min_bound to avoid offset mismatch
+        planning_min_index = np.asarray(self.voxelization.min_bound, dtype=float)  # we will treat as world origin here
+        planning_origin_world = np.asarray(self.voxelization.min_bound, dtype=float)
+
+        if planning_grid is not None:
+            planning_true_voxels = np.argwhere(planning_grid)
+            planning_kdtree = cKDTree(planning_true_voxels) if len(planning_true_voxels) > 0 else None
+        else:
+            planning_true_voxels = np.empty((0, 3), dtype=int)
+            planning_kdtree = None
+
+        def planning_idx_to_world(pidx):
+            # pidx is planning grid index (row,col,layer) relative to planning grid's 0-origin
+            return planning_origin_world + (np.asarray(pidx, dtype=float)) * self.voxel_size
+
+        def world_to_orig_voxel(world_pt):
+            # convert a world coordinate (mm) to original voxel indices (int)
+            return tuple(self.voxelization.convert_point_to_voxel(np.asarray(world_pt, dtype=float)).astype(int))
+
+        def orig_voxel_to_world(orig_vox):
+            return np.asarray(self.voxelization.min_bound, dtype=float) + np.asarray(orig_vox, dtype=float) * self.voxel_size
+
+        def line_collision_free(orig_a, orig_b, obstacle_voxel):
+            """
+            检查从 orig_a(orig voxel index) 到 orig_b 是否在 obstacle_voxel (safe) 上有碰撞
+            orig_a/orig_b 可为 voxel 索引或 world? 这里按你原逻辑：输入为 orig voxel 索引或可被转换。
+            """
+            a_w = orig_voxel_to_world(orig_a)
+            b_w = orig_voxel_to_world(orig_b)
+            vec = b_w - a_w
+            L = np.linalg.norm(vec)
+            if L <= 0:
+                ai = np.round(orig_a).astype(int)
+                if (ai < 0).any() or ai[0] >= obstacle_voxel.shape[0] or ai[1] >= obstacle_voxel.shape[1] or ai[2] >= obstacle_voxel.shape[2]:
+                    return False
+                return not bool(obstacle_voxel[ai[0], ai[1], ai[2]])
+            steps = max(2, int(L / max(1e-6, self.voxel_size * 0.5)))
+            for t in np.linspace(0.0, 1.0, steps + 1):
+                p = a_w + t * vec
+                pi = np.asarray(self.voxelization.convert_point_to_voxel(p), dtype=int)
+                if (pi < 0).any() or pi[0] >= obstacle_voxel.shape[0] or pi[1] >= obstacle_voxel.shape[1] or pi[2] >= obstacle_voxel.shape[2]:
+                    return False
+                if obstacle_voxel[pi[0], pi[1], pi[2]]:
+                    return False
+            return True
+
+        # avail: 判断 safe + planning_grid
+        def avail(x, y, z) -> bool:
+            x, y, z = int(x), int(y), int(z)
+            # safe 越界
+            if not (0 <= x < safe.shape[0] and 0 <= y < safe.shape[1] and 0 <= z < safe.shape[2]):
+                return False
+            # safe 障碍
+            if safe[x, y, z]:
+                return False
+
+            # 如果有 planning_grid，则要求该 voxel 在 planning_grid 对应位置上为 True（可走）
+            if planning_grid is not None:
+                # 将 safe 索引 (x,y,z) 转为 world，再映射到 planning grid 索引系
+                world = self.min_bound + np.array([x, y, z], dtype=float) * self.voxel_size
+                # 估算 planning grid 索引
+                idx_raw = (world - planning_origin_world) / self.voxel_size
+                idx = np.round(idx_raw).astype(int)
+                # 越界判断
+                if np.any(idx < 0) or np.any(idx >= planning_grid.shape):
+                    return False
+                if not bool(planning_grid[tuple(idx)]):
+                    return False
+
+            return True
+
+        unit_dirs = self.unit_vectors
+        id2dir = self.id2dir
+        cos_table = self.cos_table
+        axis_penalty = self._compute_axis_turn_penalty
+        angle_penalty = self._compute_turn_penalty
+        z_penalty = self.z_penalty
+        turn_penalty = self.turn_penalty
+        min_cos_threshold = 0.25
+
+        # KDTree 辅助查找函数（用于在 planning_grid 中找最近点）
+        def find_nearest_planning_voxel(pt, kdtree_max_dist_local: float = 10.0):
+            """
+            pt: 期望传入为 'safe' 索引或 world？ 保持你原来的习惯，这里我们接收体素索引或 world 坐标：
+            - 如果 pt 看起来很大（例如浮点、非整数），仍当作 world 坐标；否则当作体素索引直接查询 KDTree。
+            返回 list of planning-grid indices (tuples)
+            """
+            if planning_kdtree is None or planning_true_voxels.shape[0] == 0:
+                return []
+
+            p = np.asarray(pt, dtype=float)
+
+            # 如果 pt 看起来像是 safe 索引（小整数），则直接把它当作索引
+            # 判断依据：如果各分量都在 safe 范围内并且为接近整数，则当作索引
+            is_index_like = True
+            if p.shape[0] != 3:
+                is_index_like = False
+            else:
+                for i, val in enumerate(p):
+                    if not (0 <= val < max(safe.shape)):  # 粗略判断（只为区分 world vs index）
+                        is_index_like = False
+                        break
+
+            if is_index_like:
+                query_pt = p.astype(float)
+            else:
+                # pt 当成 world 坐标，先转换为 planning_grid 估算索引
+                query_idx = (p - planning_origin_world) / self.voxel_size
+                query_pt = np.round(query_idx).astype(float)
+
+            # 查询 KDTree（在 planning_true_voxels 空间）
+            k = min(5, planning_true_voxels.shape[0])
+            dist, ids = planning_kdtree.query(query_pt, k=k)
+
+            if np.isscalar(ids):
+                ids = [ids]
+                dist = [dist]
+
+            candidates = []
+            for didx, dval in zip(ids, dist):
+                if dval > kdtree_max_dist_local:
+                    continue
+                pidx = planning_true_voxels[int(didx)]
+                world_candidate = planning_idx_to_world(pidx)
+                orig_candidate = np.array(world_to_orig_voxel(world_candidate))
+                # 检查连线安全：使用 safe（原始体素）做校验
+                # line_collision_free 参数我们期望传入 orig voxel indices -> 它内部会把其转成 world 再进行采样
+                if line_collision_free(p if is_index_like else world_candidate, orig_candidate, safe):
+                    candidates.append(tuple(pidx))
+            return candidates
+
+        # start/goal candidates
+        start_candidates = find_nearest_planning_voxel(start)
+        goal_candidates = find_nearest_planning_voxel(goal)
+        if len(start_candidates) == 0:
+            start_candidates = [tuple(start)]
+        if len(goal_candidates) == 0:
+            goal_candidates = [tuple(goal)]
+
+        step_count = 0
+        cur = None
+        # A* 主循环
+        while openh:
+            step_count += 1
+            _, cur = heapq.heappop(openh)
+            cx, cy, cz = cur.pos
+            key = make_key(cx, cy, cz, cur.dir_id)
+            if key in closed:
+                continue
+
+            # debug 打印（每 500 步）
+            if step_count % 500 == 0:
+                print(f"[Step {step_count}] Open: {len(openh)}, Closed: {len(closed)}, Current: {cur.pos}")
+
+            # 检查是否到达 goal（允许到任一 goal candidate）
+            reached = False
+            for g in goal_candidates:
+                if tuple(cur.pos) == tuple(g):
+                    reached = True
+                    break
+            if reached:
+                path = []
+                node = cur
+                while node is not None:
+                    path.append(node.pos)
+                    node = node.parent
+                path.reverse()
+                # 计算最终方向（如果需要）
+                final_dir = np.zeros(3, dtype=float)
+                if len(path) >= 2:
+                    last = np.array(path[-1], dtype=float)
+                    prev = np.array(path[-2], dtype=float)
+                    vec = last - prev
+                    nrm = np.linalg.norm(vec)
+                    if nrm > 1e-6:
+                        final_dir = vec / nrm
+                return path, final_dir
+
+            closed.add(key)
+
+            # 遍历方向并进行延伸（extend）与 KD jump 补充
+            for dir_id, d_unit in enumerate(unit_dirs):
+                d = id2dir[dir_id]
+                # 方向剪枝
+                if cur.dir_vec is not None:
+                    cos_dir = float(cur.dir_vec @ d_unit)
+                    if cos_dir < min_cos_threshold:
+                        continue
+
+                next_pos = None
+                extended = False
+
+                # 1) 在 planning_grid / safe 空间内沿方向延伸若干步（优先）
+                for step in range(1, max_extend_steps + 1):
+                    nx = cx + int(d[0] * step)
+                    ny = cy + int(d[1] * step)
+                    nz = cz + int(d[2] * step)
+                    if avail(nx, ny, nz):
+                        next_pos = (nx, ny, nz)
+                        extended = True
+                        if step_count % 500 == 0:
+                            print(f"[Extend] {cur.pos} -> {next_pos} (step={step}, dir={d})")
+                        break
+
+                # 2) 如果延伸失败，尝试 KDTree 在 planning 瓦片中找最近合适点（跳跃）
+                if not extended:
+                    if planning_kdtree is None:
+                        continue
+                    # 用 cur.pos + d 作为查询位置（体素索引）
+                    query_pt = np.array(cur.pos, dtype=float) + np.array(d, dtype=float)
+                    candidates = find_nearest_planning_voxel(query_pt, kdtree_max_dist_local=kdtree_max_dist)
+                    if not candidates:
+                        continue
+                    # 选第一个 candidate（保持原逻辑）
+                    next_pos = candidates[0]
+                    if step_count % 500 == 0:
+                        print(f"[KDJump] {cur.pos} -> {next_pos} (dir={d})")
+
+                # 计算代价（保持原逻辑）
+                gnew = cur.g + np.linalg.norm(np.array(next_pos, dtype=float) - np.array(cur.pos, dtype=float))
+                if cur.dir_vec is not None:
+                    gnew += tangent_penalty_weight * (1 - float(cur.dir_vec @ d_unit))
+                if cur.parent is None and start_tangent is not None:
+                    gnew += boundary_penalty_weight * (1 - float(start_tangent @ d_unit))
+                if self.is_close(next_pos, goal) and goal_tangent is not None:
+                    gnew += boundary_penalty_weight * (1 - float(goal_tangent @ d_unit))
+
+                gnew += axis_penalty(cur.dir_id, dir_id)
+                gnew += angle_penalty(cur.dir_id, dir_id)
+                if abs(d[2]) > 0:
+                    gnew += z_penalty
+                if cur.dir_id is not None:
+                    c = cos_table[cur.dir_id, dir_id]
+                    if c < 0.95:
+                        gnew += (1 - c) * turn_penalty
+
+                hnew = heuristic(next_pos, goal)
+                fnew = gnew + hnew
+                state_key = make_key(*next_pos, dir_id)
+                if state_key not in openg or fnew < openg[state_key]:
+                    node = Node(next_pos, parent=cur, dir_id=dir_id, dir_vec=d_unit)
+                    node.g, node.h, node.f = gnew, hnew, fnew
+                    openg[state_key] = fnew
+                    heapq.heappush(openh, (fnew, node))
+
+        # 无路径
+        return [], None
