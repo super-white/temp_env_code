@@ -1,0 +1,516 @@
+import threading
+from typing import List, Dict, Tuple, Optional, Sequence
+import heapq
+import numpy as np
+import open3d as o3d
+from numba import njit
+from scipy.spatial import cKDTree
+
+from domain.shared_space_environment.voxel_environment_manager import VoxelEnvironmentManager
+from domain.voxelization.voxelization import Voxelization
+from infrastructure.monitor.exeution_monitor import ExecutionMonitor
+from infrastructure.logging.logger import logger
+from infrastructure.persistence.json_repository import JsonRepository
+from domain.model.node import Node
+
+
+@njit(fastmath=True)
+def heuristic(a, b):
+    # a, b can be tuples or arrays of voxel coords
+    return np.sqrt(np.sum((np.array(a) - np.array(b)) ** 2))
+
+
+class AstarCablePlanner:
+    """
+    Refactored A* planner suitable for:
+      - original safe occupancy voxel grid (safe: True = obstacle)
+      - planning voxel grid (膨胀后可走区域; True = allowed for planning)
+    Assumptions:
+      - start, goal passed to _astar are voxel indices in the same voxel coordinate system
+        as `self.voxelization.min_bound` (i.e. integer voxel coordinates).
+      - self.voxelization.min_bound and max_bound are already set by original voxelization
+      - self.planning_voxel_grid is built with the same min_bound origin (so transforms align)
+    """
+
+    def __init__(self,
+                 voxel_env: VoxelEnvironmentManager,
+                 voxelization: Voxelization,
+                 points: Optional[np.ndarray] = None,
+                 turn_penalty: float = 0.5,
+                 voxel_size: float = 4.0,
+                 debug: bool = False):
+        self.env = voxel_env
+        self.voxelization = voxelization
+        # canonical origin for converting voxel<->world
+        # these must be produced by the original voxelization function and kept consistent
+        self.min_bound = np.asarray(getattr(self.voxelization, "min_bound", None), dtype=float)
+        self.max_bound = np.asarray(getattr(self.voxelization, "max_bound", None), dtype=float)
+        self.planning_voxel_grid = getattr(self.voxelization, "planning_voxel_grid", None)
+        self.planning_voxel_origin = np.asarray(getattr(self.voxelization, "planning_voxel_origin", self.min_bound), dtype=float)
+        # planning_min_index is the min index used when building planning grid; if not set, assume zero
+        self.planning_min_index = np.asarray(getattr(self.voxelization, "planning_min_index", np.zeros(3, dtype=int)), dtype=int)
+
+        self.points = points
+        self.turn_penalty = turn_penalty
+        self.z_penalty = 0.7
+        self.dir_penalty = 0.3
+        self.voxel_size = float(voxel_size)
+        self.offset_mm = 6  # not used right now but kept
+        self.debug = debug
+
+        # directions (26 neighbors)
+        self._dirs26 = [(dx, dy, dz)
+                        for dx in [-1, 0, 1]
+                        for dy in [-1, 0, 1]
+                        for dz in [-1, 0, 1]
+                        if not (dx == dy == dz == 0)]
+        vectors = np.array(self._dirs26, dtype=float)
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        self.unit_vectors = (vectors / norms)
+        self.dir2id = {d: i for i, d in enumerate(self._dirs26)}
+        self.id2dir = {i: d for i, d in enumerate(self._dirs26)}
+        self.cos_table = np.dot(self.unit_vectors, self.unit_vectors.T).astype(np.float32)
+        self.axis_table = np.array([0 if dx != 0 else 1 if dy != 0 else 2 for dx, dy, dz in self._dirs26], dtype=np.uint8)
+        self._lock = threading.Lock()
+        self.monitor = ExecutionMonitor()
+
+    # -------------------------
+    # Coordinate helpers
+    # -------------------------
+    def voxel_to_world(self, voxel_idx: Sequence[int]) -> np.ndarray:
+        """
+        Convert integer voxel index (in the 'original' voxel coordinate system that uses self.min_bound)
+        into world coordinates (mm).
+        """
+        v = np.asarray(voxel_idx, dtype=float)
+        return self.min_bound + v * self.voxel_size
+
+    def world_to_voxel(self, world_pt: Sequence[float]) -> np.ndarray:
+        """
+        Convert world coordinate (mm) to integer voxel index in 'original' voxel grid.
+        """
+        return np.floor((np.asarray(world_pt, dtype=float) - self.min_bound) / self.voxel_size).astype(int)
+
+    def planning_idx_to_world(self, pidx: Sequence[int]) -> np.ndarray:
+        """
+        Convert planning_grid index (normalized index within planning grid) to world coordinates.
+        planning_grid index -> planning_min_index offset -> world (using planning_voxel_origin)
+        """
+        p = np.asarray(pidx, dtype=float)
+        return self.planning_voxel_origin + (self.planning_min_index + p) * self.voxel_size
+
+    def world_to_planning_idx(self, world_pt: Sequence[float]) -> Optional[np.ndarray]:
+        """
+        Convert world point to normalized planning index (int). Returns None if out of planning grid bbox.
+        """
+        idx_raw = (np.asarray(world_pt, dtype=float) - self.planning_voxel_origin) / self.voxel_size
+        idx = np.round(idx_raw).astype(int) - self.planning_min_index
+        if self.planning_voxel_grid is None:
+            return None
+        if np.any(idx < 0) or np.any(idx >= self.planning_voxel_grid.shape):
+            return None
+        return idx
+
+    # -------------------------
+    # Building KDTree for planning voxels (call once after building planning grid)
+    # -------------------------
+    def _build_planning_kdtree(self):
+        if self.planning_voxel_grid is None:
+            self._planning_true_voxels = None
+            self._planning_kdtree = None
+        else:
+            self._planning_true_voxels = np.asarray(np.argwhere(self.planning_voxel_grid), dtype=int)
+            if len(self._planning_true_voxels) > 0:
+                self._planning_kdtree = cKDTree(self._planning_true_voxels)
+            else:
+                self._planning_kdtree = None
+
+    # -------------------------
+    # Availability checks
+    # -------------------------
+    def _is_in_safe(self, x: int, y: int, z: int, safe: np.ndarray) -> bool:
+        """True if in bounds and not occupied in original safe occupancy"""
+        if not (0 <= x < safe.shape[0] and 0 <= y < safe.shape[1] and 0 <= z < safe.shape[2]):
+            return False
+        return not bool(safe[int(x), int(y), int(z)])
+
+    def _is_in_planning(self, x: int, y: int, z: int) -> bool:
+        """
+        Check if given original-voxel-index (x,y,z) corresponds to a True cell in planning_grid.
+        Steps:
+          - convert original voxel index -> world -> planning normalized index -> check planning_grid
+        """
+        if self.planning_voxel_grid is None:
+            return True  # no planning grid => allow
+        # original voxel -> world
+        world = self.voxel_to_world((x, y, z))
+        pidx = self.world_to_planning_idx(world)
+        if pidx is None:
+            return False
+        return bool(self.planning_voxel_grid[tuple(pidx)])
+
+    def avail(self, x: int, y: int, z: int, safe: np.ndarray) -> bool:
+        """Composite availability check:
+           - within safe bounds & not obstacle
+           - optionally must be inside planning_grid True cell (if planning exists)
+        """
+        x, y, z = int(x), int(y), int(z)
+        if not self._is_in_safe(x, y, z, safe):
+            return False
+        if not self._is_in_planning(x, y, z):
+            return False
+        return True
+
+    # -------------------------
+    # Line collision checker (samples along world line and tests original safe occupancy)
+    # -------------------------
+    def line_collision_free(self, orig_a: Sequence[int], orig_b: Sequence[int], obstacle_voxel: np.ndarray) -> bool:
+        """
+        orig_a, orig_b: voxel indices in original safe coordinate system (integers or floats)
+        Checks along the straight segment in world coordinates by sampling at ~voxel_size/2 resolution.
+        Returns True if no point along segment hits an occupied safe voxel.
+        """
+        a_w = self.voxel_to_world(orig_a)
+        b_w = self.voxel_to_world(orig_b)
+        vec = b_w - a_w
+        L = np.linalg.norm(vec)
+        if L <= 0:
+            pi = np.asarray(orig_a, dtype=int)
+            if np.any(pi < 0) or pi[0] >= obstacle_voxel.shape[0] or pi[1] >= obstacle_voxel.shape[1] or pi[2] >= obstacle_voxel.shape[2]:
+                return False
+            return not bool(obstacle_voxel[pi[0], pi[1], pi[2]])
+        steps = max(2, int(np.ceil(L / (self.voxel_size * 0.5))))
+        for t in np.linspace(0.0, 1.0, steps + 1):
+            p = a_w + t * vec
+            pi = self.world_to_voxel(p)
+            if np.any(pi < 0) or pi[0] >= obstacle_voxel.shape[0] or pi[1] >= obstacle_voxel.shape[1] or pi[2] >= obstacle_voxel.shape[2]:
+                return False
+            if obstacle_voxel[pi[0], pi[1], pi[2]]:
+                return False
+        return True
+
+    # -------------------------
+    # KDTree-based search for planning voxels near a given voxel (fallback)
+    # -------------------------
+    def find_nearest_planning_voxels(self, voxel_pt: Sequence[int], k=5, max_world_dist_mm: float = 200.0) -> List[Tuple[int, int, int]]:
+        """
+        Given a point expressed as an original voxel index (voxel coords), find candidate planning voxels
+        that are near and connectable. Returns list of planning normalized indices (tuples).
+        - voxel_pt: original voxel index (ints)
+        - k: how many nearest planning voxels to query
+        - max_world_dist_mm: maximum allowed distance in world mm to consider
+        """
+        if getattr(self, "_planning_kdtree", None) is None:
+            self._build_planning_kdtree()
+        if self._planning_kdtree is None:
+            return []
+
+        # convert original voxel -> planning normalized index estimate (works because we share min_bound)
+        world_pt = self.voxel_to_world(voxel_pt)
+        # planning idx in world coords: pidx_world_coords = (world_pt - planning_origin) / voxel_size - planning_min_index
+        idx_est = (world_pt - self.planning_voxel_origin) / self.voxel_size - self.planning_min_index
+        idx_est = np.round(idx_est).astype(int)
+        # query KDTree in planning-index-space
+        kq = min(k, len(self._planning_true_voxels))
+        try:
+            dist, ids = self._planning_kdtree.query(idx_est, k=kq)
+        except Exception:
+            return []
+        if np.isscalar(ids):
+            ids = [ids]
+            dist = [dist]
+        candidates = []
+        for d, i in zip(dist, ids):
+            # convert planning index back to world dist (d is in planning-index units)
+            world_distance_mm = float(d) * self.voxel_size
+            if world_distance_mm > max_world_dist_mm:
+                continue
+            pidx = tuple(self._planning_true_voxels[int(i)].tolist())
+            # convert to original voxel candidate for collision test
+            world_candidate = self.planning_idx_to_world(pidx)
+            orig_candidate = tuple(self.world_to_voxel(world_candidate))
+            # quick collision test along straight line
+            if self.line_collision_free(voxel_pt, orig_candidate, obstacle_voxel=safe):
+                candidates.append(pidx)
+        return candidates
+
+    # -------------------------
+    # When KDTree returns a planning voxel far away, we must fill intermediate voxels (discrete Bresenham-like)
+    # -------------------------
+    def voxels_on_line(self, a_vox: Sequence[int], b_vox: Sequence[int]) -> List[Tuple[int, int, int]]:
+        """
+        Return integer voxel coordinates along discrete line from a_vox to b_vox (inclusive).
+        Uses simple linear interpolation at step ~ voxel_size.
+        """
+        a = np.asarray(a_vox, dtype=int)
+        b = np.asarray(b_vox, dtype=int)
+        vec = b.astype(float) - a.astype(float)
+        L = np.linalg.norm(vec)
+        if L == 0:
+            return [tuple(a.tolist())]
+        steps = max(1, int(np.ceil(L)))  # stepping by ~1 voxel
+        pts = []
+        for t in np.linspace(0.0, 1.0, steps + 1):
+            p = a + t * (b - a)
+            pi = np.round(p).astype(int)
+            pts.append((int(pi[0]), int(pi[1]), int(pi[2])))
+        # unique consecutive
+        out = [pts[0]]
+        for p in pts[1:]:
+            if p != out[-1]:
+                out.append(p)
+        return out
+
+    # -------------------------
+    # The main A* implementation (refined)
+    # -------------------------
+    def _astar(self,
+               cid: int,
+               safe: np.ndarray,
+               start: Tuple[int, int, int],
+               goal: Tuple[int, int, int],
+               start_tangent=None,
+               goal_tangent=None,
+               tangent_penalty_weight: float = 5.0,
+               boundary_penalty_weight: float = 5.0,
+               max_extend_steps: int = 5,
+               kdtree_max_dist_mm: float = 200.0,
+               log_every: int = 5000) -> List[Tuple[int, int, int]]:
+        """
+        A* that:
+         - prefers nodes inside planning_grid (must be planning_grid True to traverse)
+         - performs directional extension (step > 1) to accelerate
+         - uses planning KDTree to jump to distant planning voxels when local neighbors are absent
+         - when jumping, fills intermediate voxels and validates via line collision checks
+        Returns list of voxel tuples (path) or empty list if not found.
+        """
+
+        MAX_X, MAX_Y, MAX_Z = safe.shape
+
+        def make_key(x, y, z, dir_id):
+            return (((int(x) * int(MAX_Y) + int(y)) * int(MAX_Z) + int(z)) * 32 + (dir_id if dir_id is not None else 0))
+
+        openh = []
+        openg = {}
+        closed = set()
+
+        # start/goal: ensure tuples of ints
+        start = tuple(int(x) for x in start)
+        goal = tuple(int(x) for x in goal)
+
+        s = Node(start, parent=None, dir_id=None)
+        s.dir_vec = np.asarray(start_tangent, dtype=float) if start_tangent is not None else None
+        s.g = 0.0
+        s.h = float(heuristic(start, goal))
+        s.f = s.h
+        heapq.heappush(openh, (s.f, s))
+        openg[make_key(*start, None)] = s.f
+
+        # ensure KDTree built
+        self._build_planning_kdtree()
+
+        step_count = 0
+        while openh:
+            step_count += 1
+            fcur, cur = heapq.heappop(openh)
+
+            # debug print occasionally
+            if self.debug and step_count % log_every == 0:
+                logger.info(f"[Step {step_count}] Open {len(openh)} Closed {len(closed)} Cur {cur.pos}")
+
+            cx, cy, cz = cur.pos
+            key = make_key(cx, cy, cz, cur.dir_id)
+            if key in closed:
+                continue
+            # check goal reached (exact voxel)
+            if (cx, cy, cz) == goal:
+                # reconstruct path
+                path = []
+                node = cur
+                while node is not None:
+                    path.append(tuple(node.pos))
+                    node = node.parent
+                path.reverse()
+                return path
+
+            closed.add(key)
+
+            # neighbor expansion (26 directions)
+            for dir_id, d in enumerate(self._dirs26):
+                d_unit = self.unit_vectors[dir_id]
+                # 1) direction pruning by angle with current direction
+                if cur.dir_vec is not None:
+                    cos_dir = float(np.dot(cur.dir_vec, d_unit))
+                    if cos_dir < 0.25:
+                        continue
+
+                # 2) attempt extension up to max_extend_steps along this direction (prefer nearest planning voxels)
+                chosen_next = None
+                chosen_mode = None  # "local", "planning_jump"
+                for step in range(1, max_extend_steps + 1):
+                    nx = int(cx + d[0] * step)
+                    ny = int(cy + d[1] * step)
+                    nz = int(cz + d[2] * step)
+                    if not (0 <= nx < MAX_X and 0 <= ny < MAX_Y and 0 <= nz < MAX_Z):
+                        break
+                    if self.avail(nx, ny, nz, safe):
+                        chosen_next = (nx, ny, nz)
+                        chosen_mode = "local"
+                        break
+
+                # 3) if not found locally, try KDTree jump to nearest planning voxel aligned with direction
+                if chosen_next is None and self._planning_kdtree is not None:
+                    # attempt to find planning voxels near the small-offset point cx+dx,cy+dy,cz+dz
+                    probe = (int(cx + d[0]), int(cy + d[1]), int(cz + d[2]))
+                    candidates = self.find_nearest_planning_voxels(probe, k=8, max_world_dist_mm=kdtree_max_dist_mm)
+                    # choose best candidate based on angle alignment and distance
+                    best_candidate = None
+                    best_score = 1e9
+                    for pidx in candidates:
+                        # pidx is planning normalized index (tuple) -> world -> orig voxel
+                        world_cand = self.planning_idx_to_world(pidx)
+                        orig_cand = tuple(self.world_to_voxel(world_cand))
+                        vec = np.asarray(orig_cand, dtype=float) - np.asarray((cx, cy, cz), dtype=float)
+                        if np.linalg.norm(vec) < 1e-6:
+                            continue
+                        # angle alignment score (prefer same direction) and distance
+                        cosv = float(np.dot(d_unit, vec / (np.linalg.norm(vec) + 1e-12)))
+                        angle_penalty = (1.0 - cosv)
+                        dist = float(np.linalg.norm(vec))  # voxels
+                        score = dist + angle_penalty * 5.0  # tuneable
+                        if score < best_score:
+                            best_score = score
+                            best_candidate = orig_cand
+                    if best_candidate is not None:
+                        # require a line collision check and then fill intermediate voxels
+                        line_voxels = self.voxels_on_line((cx, cy, cz), best_candidate)
+                        # verify all voxels in line are valid in safe & planning (we require every intermediate voxel passes safe,
+                        # but it's acceptable that intermediate voxels are not planning-grid cells - they just need to be safe).
+                        blocked = False
+                        for pv in line_voxels:
+                            if not self._is_in_safe(*pv, safe):
+                                blocked = True
+                                break
+                        if not blocked:
+                            # use the first step on that line that's not equal to current (i.e. progress)
+                            if len(line_voxels) >= 2:
+                                chosen_next = line_voxels[1]
+                                chosen_mode = "planning_jump"
+                            else:
+                                chosen_next = line_voxels[0]
+                                chosen_mode = "planning_jump"
+
+                if chosen_next is None:
+                    # no neighbor in this direction
+                    continue
+
+                # now we have chosen_next (which is an original voxel index tuple)
+                next_pos = tuple(int(v) for v in chosen_next)
+
+                # compute cost metrics (g/h)
+                # g increment = Euclidean voxel distance (so jumping longer increases g accordingly)
+                step_cost = float(np.linalg.norm(np.asarray(next_pos) - np.asarray((cx, cy, cz))))
+                gnew = cur.g + step_cost
+                # direction smoothness penalty if we have a prior direction
+                if cur.dir_vec is not None:
+                    gnew += tangent_penalty_weight * (1.0 - float(np.dot(cur.dir_vec, self.unit_vectors[dir_id])))
+                # start/goal boundary tangents
+                if cur.parent is None and start_tangent is not None:
+                    gnew += boundary_penalty_weight * (1.0 - float(np.dot(start_tangent, self.unit_vectors[dir_id])))
+                if self.is_close(next_pos, goal) and goal_tangent is not None:
+                    gnew += boundary_penalty_weight * (1.0 - float(np.dot(goal_tangent, self.unit_vectors[dir_id])))
+
+                # axis/turn penalties
+                gnew += self._compute_axis_turn_penalty(cur.dir_id, dir_id)
+                gnew += self._compute_turn_penalty(cur.dir_id, dir_id)
+                if abs(self.id2dir[dir_id][2]) > 0:
+                    gnew += self.z_penalty
+                if cur.dir_id is not None:
+                    c = float(self.cos_table[cur.dir_id, dir_id])
+                    if c < 0.95:
+                        gnew += (1.0 - c) * self.turn_penalty
+
+                hnew = float(heuristic(next_pos, goal))
+                fnew = gnew + hnew
+
+                state_key = make_key(*next_pos, dir_id)
+                if state_key not in openg or fnew < openg[state_key]:
+                    # when we used a "planning_jump" and jumped more than 1 voxel, we push node at next_pos but its parent is cur,
+                    # the line between will be validated on extraction if needed (we already validated safe)
+                    node = Node(next_pos, parent=cur, dir_id=dir_id, dir_vec=self.unit_vectors[dir_id])
+                    node.g, node.h, node.f = gnew, hnew, fnew
+                    openg[state_key] = fnew
+                    heapq.heappush(openh, (fnew, node))
+
+        # not found
+        return []
+
+    # small wrappers for penalties (reuse)
+    def _compute_turn_penalty(self, prev_dir_id: int, curr_dir_id: int) -> float:
+        if prev_dir_id is None:
+            return 0.0
+        cos_sim = float(self.cos_table[prev_dir_id, curr_dir_id])
+        return 0.0 if cos_sim >= 0.95 else (1.0 - cos_sim) * self.turn_penalty
+
+    def _compute_axis_turn_penalty(self, prev_dir_id: int, curr_dir_id: int) -> float:
+        if prev_dir_id is None:
+            return 0.0
+        return self.turn_penalty if self.axis_table[prev_dir_id] != self.axis_table[curr_dir_id] else 0.0
+
+    # -------------------------
+    # Public helper: build planning grid (example, keep your original impl)
+    # -------------------------
+    def build_planning_voxel_grid_dilated(self, stl_path: str, dilate_mm: float = 60.0):
+        """
+        Example utility that mirrors your original voxelization but ensures coordinate system alignment:
+        - uses self.min_bound/self.max_bound from original voxelization to align indices with original grid.
+        - produces self.planning_voxel_grid (boolean) and metadata planning_min_index/planning_voxel_origin
+        """
+        import numpy as np
+        from scipy.ndimage import binary_dilation
+
+        mesh = o3d.io.read_triangle_mesh(stl_path)
+        mesh = mesh.remove_duplicated_vertices()
+        mesh = mesh.remove_degenerate_triangles()
+        mesh = mesh.remove_non_manifold_edges()
+        points = np.asarray(mesh.sample_points_uniformly(number_of_points=200000).points)
+        if points.shape[0] == 0:
+            raise RuntimeError("Empty pointcloud from STL")
+
+        # align with original min_bound / max_bound
+        if self.min_bound is None or self.max_bound is None:
+            min_bound = points.min(axis=0)
+            max_bound = points.max(axis=0)
+        else:
+            min_bound = self.min_bound
+            max_bound = self.max_bound
+
+        self.planning_voxel_origin = np.asarray(min_bound, dtype=float)
+        grid_shape = np.ceil((max_bound - min_bound) / self.voxel_size).astype(int) + 1
+        self.planning_min_index = np.zeros(3, dtype=int)
+
+        voxel_indices = ((points - self.planning_voxel_origin) / self.voxel_size).astype(int)
+        # clamp
+        voxel_indices = np.maximum(voxel_indices, 0)
+        voxel_indices = np.minimum(voxel_indices, grid_shape - 1)
+
+        from collections import defaultdict
+        vc = defaultdict(int)
+        for idx in voxel_indices:
+            vc[tuple(idx)] += 1
+
+        occupancy = np.zeros(grid_shape, dtype=bool)
+        for idx in vc.keys():
+            occupancy[idx] = True
+
+        dilate_vox = int(np.ceil(dilate_mm / self.voxel_size))
+        structure = np.ones((2 * dilate_vox + 1, 2 * dilate_vox + 1, 2 * dilate_vox + 1), dtype=bool)
+        occupancy_dilated = binary_dilation(occupancy, structure=structure)
+        planning_grid = occupancy_dilated.astype(bool)
+
+        # save
+        self.planning_voxel_grid = planning_grid
+        # rebuild KDTree
+        self._build_planning_kdtree()
+        logger.info(f"[A*] planning grid built shape={planning_grid.shape}, voxels={planning_grid.sum()}")
+        return planning_grid
