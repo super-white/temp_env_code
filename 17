@@ -1,0 +1,367 @@
+def _astar(self, cid: int, safe: np.ndarray,
+           start: Tuple[int, int, int], goal: Tuple[int, int, int],
+           start_tangent=None, goal_tangent=None,
+           tangent_penalty_weight=5.0, boundary_penalty_weight=5,
+           max_extend_steps=5, kdtree_max_dist=20.0):
+    """
+    分层 A*：cluster-level + safe-level 连接
+    返回：完整连续体素路径（list of (x,y,z)）
+    """
+
+    from scipy.spatial import cKDTree
+    import heapq
+    import numpy as np
+    from collections import deque, defaultdict
+
+    # ---- 基本准备 ----
+    planning_grid = getattr(self, "planning_voxel_grid", None)
+    if planning_grid is None:
+        # 如果没有 planning_grid，回退到原始 safe 全域 A*
+        logger.info("No planning_grid found, fallback to original safe A*")
+        return self._astar_fallback_safe_only(cid, safe, start, goal, start_tangent, goal_tangent)
+
+    # convert planning grid voxels -> list, build KDTree for planning voxels (indices in planning_grid coord)
+    planning_true_voxels = np.argwhere(planning_grid)  # shape (M,3)
+    if len(planning_true_voxels) == 0:
+        logger.error("planning_grid empty")
+        return []
+
+    planning_kdtree = cKDTree(planning_true_voxels)
+
+    # cluster 分割（连通组件，26 邻域）
+    def build_clusters(planning_grid):
+        # 返回 clusters 列表，每个元素 {'id':i,'voxels':np.array, 'boundary':np.array}
+        # 简单 BFS/DFS 连通分量提取
+        visited = np.zeros(planning_grid.shape, dtype=bool)
+        clusters = []
+        dirs26 = [(dx,dy,dz) for dx in [-1,0,1] for dy in [-1,0,1] for dz in [-1,0,1] if not (dx==dy==dz==0)]
+        shape = planning_grid.shape
+        def in_bounds(x,y,z):
+            return 0<=x<shape[0] and 0<=y<shape[1] and 0<=z<shape[2]
+        idc = 0
+        for idx in np.argwhere(planning_grid):
+            x,y,z = idx
+            if visited[x,y,z]:
+                continue
+            # BFS
+            q = deque()
+            q.append((x,y,z))
+            comp = []
+            visited[x,y,z] = True
+            while q:
+                vx,vy,vz = q.popleft()
+                comp.append((vx,vy,vz))
+                for dx,dy,dz in dirs26:
+                    nx,ny,nz = vx+dx, vy+dy, vz+dz
+                    if in_bounds(nx,ny,nz) and not visited[nx,ny,nz] and planning_grid[nx,ny,nz]:
+                        visited[nx,ny,nz] = True
+                        q.append((nx,ny,nz))
+            comp = np.array(comp, dtype=int)
+            # compute boundary: voxels that have at least one neighbor not planning_grid
+            boundary = []
+            for (vx,vy,vz) in comp:
+                is_boundary = False
+                for dx,dy,dz in dirs26:
+                    nx,ny,nz = vx+dx, vy+dy, vz+dz
+                    if not in_bounds(nx,ny,nz) or not planning_grid[nx,ny,nz]:
+                        is_boundary = True
+                        break
+                if is_boundary:
+                    boundary.append((vx,vy,vz))
+            clusters.append({'id': idc, 'voxels': comp, 'boundary': np.asarray(boundary, dtype=int)})
+            idc += 1
+        return clusters
+
+    clusters = build_clusters(planning_grid)
+    logger.info(f"Built {len(clusters)} planning clusters")
+
+    # mapping voxel -> cluster_id for quick lookup
+    voxel_to_cluster = {}
+    for c in clusters:
+        cid_local = c['id']
+        for v in c['voxels']:
+            voxel_to_cluster[tuple(v)] = cid_local
+
+    # helper: get cluster id for a planning voxel (tuple)
+    def get_cluster_for_planning_voxel(pvoxel):
+        return voxel_to_cluster.get(tuple(pvoxel), None)
+
+    # convert between coordinate systems:
+    # we will treat planning_true_voxels (and clusters) as in planning-grid indices
+    # but safe grid and start/goal are given in ORIGINAL safe grid indices (your current convention).
+    planning_min_index = np.asarray(self.voxelization.planning_min_index, dtype=float)  # should align to original min_bound
+    planning_origin_world = np.asarray(self.voxelization.planning_voxel_origin, dtype=float)  # world origin for planning-grid
+
+    def planning_idx_to_world(pidx):
+        return planning_origin_world + (planning_min_index + np.asarray(pidx, dtype=float)) * self.voxel_size
+
+    def world_to_orig_voxel(world_pt):
+        return tuple(self.voxelization.convert_point_to_voxel(np.asarray(world_pt, dtype=float)).astype(int))
+
+    def orig_voxel_to_world(orig_vox):
+        return np.asarray(self.voxelization.min_bound, dtype=float) + np.asarray(orig_vox, dtype=float) * self.voxel_size
+
+    # safe-level A* function (你已有的 local safe A*,复用)
+    def local_safe_astar(orig_a, orig_b):
+        # 输入 & 输出均为原始 safe grid 的 voxel 索引 tuple/list
+        # 返回 path(list of orig voxels) or None if blocked
+        # 你已有的 line_collision_free 做快速检查，但这里要运行你的 safe A*（原始版本）
+        # 这里作为占位，调用你原先实现的 safe-only _astar_fallback (需要你提供或将其实现为函数)
+        return self._astar_safe_only(orig_a, orig_b, safe)  # 你需把旧的 safe-only A* 提取为该函数
+
+    # ---- 构建 cluster 间的连接边（缓存） ----
+    # edge_cache key: (tuple(entry_from), tuple(entry_to)) -> {'path':..., 'cost':..., 'valid':bool}
+    edge_cache = {}
+
+    # 为了缩小候选：只尝试相距最近的 K 个 cluster 对（用 cluster 重心 KDTree）
+    cluster_centers = np.array([c['voxels'].mean(axis=0) for c in clusters])
+    cluster_kdtree = cKDTree(cluster_centers)
+    # 对每个 cluster，找到近邻 cluster list（半径或 topK）
+    cluster_neighbors = {}
+    max_neighbor = 8
+    for i, center in enumerate(cluster_centers):
+        dists, ids = cluster_kdtree.query(center, k=min(max_neighbor, len(cluster_centers)))
+        # ids may include itself; filter
+        nbrs = [int(idx) for idx in np.atleast_1d(ids) if int(idx) != i]
+        cluster_neighbors[i] = nbrs
+
+    # compute connection candidates between clusters (only boundary->boundary combos but limit count)
+    def build_edges_for_cluster_pair(cid_from, cid_to, max_pairs=6):
+        key_pair = (cid_from, cid_to)
+        # iterate boundary samples: sample up to S points from boundary each side
+        b_from = clusters[cid_from]['boundary']
+        b_to = clusters[cid_to]['boundary']
+        if len(b_from)==0 or len(b_to)==0:
+            return []
+
+        # sample candidates by distance in planning idx space
+        # compute pairwise distances but limit to top few
+        # faster: build KDTree for b_to and query each from b_from
+        kd_b_to = cKDTree(b_to)
+        candidates = []
+        for bf in b_from:
+            dists, ids = kd_b_to.query(bf, k=min(5, len(b_to)))
+            if np.isscalar(ids):
+                ids = [ids]; dists=[dists]
+            for dd, idx in zip(np.atleast_1d(dists), np.atleast_1d(ids)):
+                bt = b_to[int(idx)]
+                # convert planning idx -> orig vox world -> orig voxel indices
+                world_from = planning_idx_to_world(bf)
+                world_to = planning_idx_to_world(bt)
+                orig_from = tuple(self.voxelization.convert_point_to_voxel(world_from).astype(int))
+                orig_to = tuple(self.voxelization.convert_point_to_voxel(world_to).astype(int))
+                # quick line collision test
+                if line_collision_free(orig_from, orig_to, safe):
+                    # compute actual path using safe-A*
+                    p = local_safe_astar(orig_from, orig_to)
+                    if p is not None and len(p)>0:
+                        cost = len(p)  # or compute proper metric
+                        candidates.append((tuple(bf), tuple(bt), cost, p))
+            # optional early stop if too many candidates found
+            if len(candidates) >= max_pairs:
+                break
+
+        # sort by cost and keep top max_pairs
+        candidates.sort(key=lambda x: x[2])
+        return candidates[:max_pairs]
+
+    # prebuild edges for nearby cluster pairs (cache)
+    for cid_i in range(len(clusters)):
+        for cid_j in cluster_neighbors[cid_i]:
+            # avoid duplicate building both ways; build both directions symmetrical if needed
+            pairs = build_edges_for_cluster_pair(cid_i, cid_j, max_pairs=6)
+            for bf, bt, cost, path in pairs:
+                edge_cache[( (cid_i, bf), (cid_j, bt) )] = {'path': path, 'cost': cost, 'valid': True}
+
+    logger.info(f"Built edge cache size: {len(edge_cache)}")
+
+    # ---- supernode graph search ----
+    # supernodes: entry nodes = all cached entry points + special start/goal entries
+    # prepare mapping entry->unique id
+    entry_nodes = []   # list of tuples (cluster_id, planning_idx_tuple)
+    entry_to_id = {}
+    id_to_entry = []
+
+    # add cached entries
+    for ((cid_from, p_from),(cid_to,p_to)),meta in edge_cache.items():
+        # add both endpoints
+        if (cid_from, p_from) not in entry_to_id:
+            entry_to_id[(cid_from,p_from)] = len(entry_nodes); entry_nodes.append((cid_from,p_from)); id_to_entry.append((cid_from,p_from))
+        if (cid_to, p_to) not in entry_to_id:
+            entry_to_id[(cid_to,p_to)] = len(entry_nodes); entry_nodes.append((cid_to,p_to)); id_to_entry.append((cid_to,p_to))
+
+    # add start as pseudo-entry: if start inside a planning cluster, add that exact planning voxel; else find nearest planning voxels that are connectable
+    def find_start_entries(start_orig):
+        # start_orig currently is safe-grid voxel index (你的调用是传体素)
+        # convert to world & to planning idx estimate
+        world_s = orig_voxel_to_world(start_orig)
+        # query planning_kdtree
+        dists, idxs = planning_kdtree.query((world_s - planning_origin_world)/self.voxel_size - planning_min_index, k=min(8, len(planning_true_voxels)))
+        if np.isscalar(idxs):
+            idxs=[idxs]; dists=[dists]
+        entries = []
+        for i,d in zip(idxs, np.atleast_1d(dists)):
+            pv = tuple(planning_true_voxels[int(i)])
+            # check line collision from start_orig -> that planning entry orig voxel
+            world_candidate = planning_idx_to_world(pv)
+            orig_candidate = tuple(self.voxelization.convert_point_to_voxel(world_candidate).astype(int))
+            if line_collision_free(start_orig, orig_candidate, safe):
+                cid_pl = get_cluster_for_planning_voxel(pv)
+                if cid_pl is not None:
+                    if (cid_pl, pv) not in entry_to_id:
+                        entry_to_id[(cid_pl,pv)] = len(entry_nodes); entry_nodes.append((cid_pl,pv)); id_to_entry.append((cid_pl,pv))
+                    entries.append((cid_pl,pv))
+        return entries
+
+    start_orig = tuple(start)  # 你的 start 是 orig voxel index
+    goal_orig = tuple(goal)
+    start_entries = find_start_entries(start_orig)
+    goal_entries = find_start_entries(goal_orig)
+    if len(start_entries)==0:
+        # no planning entry reachable, treat start itself as pseudo node (will rely on safe-only A*)
+        logger.warning("start has no reachable planning entry; will use safe-only route from start to closest entry later")
+    if len(goal_entries)==0:
+        logger.warning("goal has no reachable planning entry; will use safe-only route to goal later")
+
+    # build adjacency list for supergraph from edge_cache
+    super_adj = defaultdict(list)  # id -> list of (neighbor_id, cost, edge_key)
+    for ((cid_from,p_from),(cid_to,p_to)), meta in edge_cache.items():
+        id_from = entry_to_id[(cid_from,p_from)]
+        id_to = entry_to_id[(cid_to,p_to)]
+        super_adj[id_from].append((id_to, meta['cost'], ((cid_from,p_from),(cid_to,p_to))))
+        # also add reverse if path exists reverse-cost (we built both directions maybe)
+        # you may want to add symmetric edge if needed
+
+    # If start/goal entries were added, we can run supergraph A* from any start_entry to any goal_entry
+    # Use best_cost dict (allow revisit only when cost improves)
+    import math
+    openh = []
+    best_cost = {}
+    prev = {}
+    # push all start entries with their zero cost (or cost to reach that entry from start using safe-A*)
+    for s_entry in start_entries:
+        sid = entry_to_id[s_entry]
+        # cost to reach entry: safe-A* from start_orig to orig(entry)
+        world_e = planning_idx_to_world(s_entry[1])
+        orig_e = tuple(self.voxelization.convert_point_to_voxel(world_e).astype(int))
+        path0 = local_safe_astar(start_orig, orig_e)
+        if path0 is None:
+            continue
+        c0 = len(path0)
+        best_cost[sid] = c0
+        heapq.heappush(openh, (c0 + 0.0, sid))  # heuristics can be added
+        prev[sid] = ('START', None)  # marker
+
+    # If no start entries, consider starting with closest planning voxel by direct KDTree but allow safe A* later
+    if len(openh)==0:
+        logger.warning("no start entries reachable; fallback to safe-only planning between start and goal")
+        return self._astar_safe_only(start_orig, goal_orig, safe)
+
+    goal_ids = set(entry_to_id[e] for e in goal_entries)
+
+    found_goal = None
+    while openh:
+        cur_f, cur_id = heapq.heappop(openh)
+        cur_cost = best_cost[cur_id]
+        if cur_id in goal_ids:
+            found_goal = cur_id
+            break
+        # expand neighbors
+        for (nei_id, edge_cost, edge_key) in super_adj.get(cur_id, []):
+            new_cost = cur_cost + edge_cost
+            if nei_id not in best_cost or new_cost < best_cost[nei_id] - 1e-6:
+                best_cost[nei_id] = new_cost
+                prev[nei_id] = (cur_id, edge_key)
+                # push with heuristic: use euclidean between entry and any goal entry (simple)
+                # compute heuristic minimal distance to any goal entry (in planning idx * voxel_size)
+                def heuristic_entry(eid):
+                    e_pl = id_to_entry[eid][1]
+                    e_world = planning_idx_to_world(e_pl)
+                    # use distance to nearest goal entry world
+                    dmin = min(np.linalg.norm(e_world - planning_idx_to_world(id_to_entry[g][1])) for g in goal_ids)
+                    return dmin / self.voxel_size
+                est_h = heuristic_entry(nei_id)
+                heapq.heappush(openh, (new_cost + est_h, nei_id))
+
+    if found_goal is None:
+        logger.warning("Supergraph search failed to find connection; fallback to safe-only between start and goal")
+        return self._astar_safe_only(start_orig, goal_orig, safe)
+
+    # reconstruct supergraph path -> sequence of edge_keys
+    seq = []
+    cur = found_goal
+    while True:
+        p = prev[cur]
+        if p[0] == 'START':
+            start_edge = p
+            break
+        seq.append(p[1])  # edge_key
+        cur = p[0]
+    seq.reverse()
+
+    # now expand seq into full voxel path
+    full_path = []
+    # first: path0 from start_orig to first entry
+    first_entry_id = prev[found_goal][1][0] if seq else prev[found_goal][0]
+    # but simpler: reconstruct by walking prev from start entries: easier approach below
+    # walk from start entry pushed earlier to found_goal via prev chain, appending safe-A* results
+
+    # reconstruct using prev chain to produce sequence of entry nodes
+    entry_chain = []
+    node = found_goal
+    while node in prev and prev[node][0] != 'START':
+        entry_chain.append(node)
+        node = prev[node][0]
+    entry_chain.append(node)  # last is start entry id
+    entry_chain = entry_chain[::-1]
+
+    # path from start_orig to first entry orig
+    first_entry = id_to_entry[entry_chain[0]]
+    world_first = planning_idx_to_world(first_entry[1])
+    orig_first = tuple(self.voxelization.convert_point_to_voxel(world_first).astype(int))
+    path0 = local_safe_astar(start_orig, orig_first)
+    if path0 is None:
+        logger.error("start->first_entry path unexpectedly failed")
+        return []
+
+    full_path.extend(path0)
+
+    # for each adjacent pair of entries in chain, append cached edge path
+    for i in range(len(entry_chain)-1):
+        a_id = entry_chain[i]; b_id = entry_chain[i+1]
+        a_entry = id_to_entry[a_id]; b_entry = id_to_entry[b_id]
+        edge_key = ((a_entry[0], a_entry[1]), (b_entry[0], b_entry[1]))
+        meta = edge_cache.get(edge_key)
+        if meta is None:
+            # maybe reversed edge
+            edge_key_rev = ((b_entry[0], b_entry[1]), (a_entry[0], a_entry[1]))
+            meta = edge_cache.get(edge_key_rev)
+            if meta is None:
+                logger.error("missing cached edge between entries")
+                return []
+            # if reversed, reverse path
+            seg = meta['path'][::-1]
+        else:
+            seg = meta['path']
+        # append seg but avoid duplicate vertex at join
+        if len(full_path)>0 and full_path[-1] == seg[0]:
+            full_path.extend(seg[1:])
+        else:
+            full_path.extend(seg)
+
+    # finally from last entry to goal
+    last_entry = id_to_entry[entry_chain[-1]]
+    world_last = planning_idx_to_world(last_entry[1])
+    orig_last = tuple(self.voxelization.convert_point_to_voxel(world_last).astype(int))
+    path_end = local_safe_astar(orig_last, goal_orig)
+    if path_end is None:
+        logger.error("last_entry -> goal failed")
+        return []
+    # join
+    if full_path and full_path[-1] == path_end[0]:
+        full_path.extend(path_end[1:])
+    else:
+        full_path.extend(path_end)
+
+    logger.info(f"Final path length (voxels): {len(full_path)}")
+    return full_path
