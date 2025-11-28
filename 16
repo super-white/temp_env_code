@@ -1,0 +1,288 @@
+def _astar(self, cid: int, safe: np.ndarray,
+           start: Tuple[int, int, int], goal: Tuple[int, int, int],
+           start_tangent=None, goal_tangent=None,
+           tangent_penalty_weight=5.0, boundary_penalty_weight=5,
+           max_extend_steps=5, kdtree_max_dist=20):
+
+    from scipy.spatial import cKDTree
+    import heapq
+    import numpy as np
+
+    MAX_X, MAX_Y, MAX_Z = safe.shape
+
+    def make_key(x, y, z, dir_id):
+        return (((int(x) * MAX_Y + int(y)) * MAX_Z + int(z)) * 32 + (int(dir_id) if dir_id is not None else 0))
+
+    openh = []
+    openg = {}
+    closed = set()
+
+    # start / goal are expected as original safe voxel indices (integers / tuples)
+    s = Node(tuple(map(int, start)), parent=None, dir_id=None)
+    s.dir_vec = np.asarray(start_tangent, dtype=np.float32) if start_tangent is not None else None
+    s.g = 0.0
+    s.h = heuristic(start, goal)
+    s.f = s.h
+    heapq.heappush(openh, (s.f, s))
+    openg[make_key(*s.pos, None)] = s.f
+
+    planning_grid = getattr(self, "planning_voxel_grid", None)
+    # planning_min_index should be planning grid's min index. If not present, fallback to zeros.
+    planning_min_index = getattr(self.voxelization, "planning_min_index", None)
+    if planning_min_index is None:
+        planning_min_index = np.zeros(3, dtype=int)
+    planning_min_index = np.asarray(planning_min_index, dtype=float)
+
+    # planning_origin_world: world coordinate of "planning grid origin"
+    # Usually we align it with self.voxelization.min_bound (the original mesh min bound).
+    planning_origin_world = np.asarray(getattr(self.voxelization, "planning_voxel_origin", None)
+                                       or getattr(self.voxelization, "min_bound", None)
+                                       or self.min_bound, dtype=float)
+
+    if planning_grid is not None:
+        planning_true_voxels = np.argwhere(planning_grid)  # in planning-local indices (0..shape-1)
+        planning_kdtree = cKDTree(planning_true_voxels) if len(planning_true_voxels) > 0 else None
+    else:
+        planning_true_voxels = np.empty((0, 3), dtype=int)
+        planning_kdtree = None
+
+    def planning_idx_to_world(pidx):
+        # pidx is planning-local index (0..)
+        p = np.asarray(pidx, dtype=float)
+        return planning_origin_world + (planning_min_index + p) * self.voxel_size
+
+    def world_to_orig_voxel(world_pt):
+        # returns original voxel indices consistent with safe array indexing (tuple of ints)
+        return tuple(self.voxelization.convert_point_to_voxel(np.asarray(world_pt, dtype=float)).astype(int))
+
+    def orig_voxel_to_world(orig_vox):
+        return np.asarray(self.voxelization.min_bound, dtype=float) + np.asarray(orig_vox, dtype=float) * self.voxel_size
+
+    def line_collision_free(orig_a, orig_b, obstacle_voxel):
+        # orig_a / orig_b are in original voxel indices (or convertible)
+        a_w = orig_voxel_to_world(orig_a)
+        b_w = orig_voxel_to_world(orig_b)
+        vec = b_w - a_w
+        L = np.linalg.norm(vec)
+        if L <= 0:
+            ai = np.round(orig_a).astype(int)
+            if (ai < 0).any() or ai[0] >= obstacle_voxel.shape[0] or ai[1] >= obstacle_voxel.shape[1] or ai[2] >= obstacle_voxel.shape[2]:
+                return False
+            return not bool(obstacle_voxel[ai[0], ai[1], ai[2]])
+        # sample along the segment at ~half voxel step
+        steps = max(2, int(np.ceil(L / (self.voxel_size * 0.5))))
+        for t in np.linspace(0.0, 1.0, steps + 1):
+            p = a_w + t * vec
+            pi = np.asarray(self.voxelization.convert_point_to_voxel(p), dtype=int)
+            if (pi < 0).any() or pi[0] >= obstacle_voxel.shape[0] or pi[1] >= obstacle_voxel.shape[1] or pi[2] >= obstacle_voxel.shape[2]:
+                return False
+            if obstacle_voxel[pi[0], pi[1], pi[2]]:
+                return False
+        return True
+
+    # avail: checks (1) safe bounds and occupancy, (2) if planning_grid exists, require the corresponding planning voxel to be True (可走)
+    def avail(x, y, z):
+        x, y, z = int(x), int(y), int(z)
+
+        # 1) safe 越界
+        if not (0 <= x < safe.shape[0] and 0 <= y < safe.shape[1] and 0 <= z < safe.shape[2]):
+            return False
+
+        # 2) safe 障碍
+        if safe[x, y, z]:
+            return False
+
+        # 3) 若存在 planning_grid，要求对应 planning voxel 为 True（可走）
+        if planning_grid is not None:
+            # convert safe index -> world
+            world = np.asarray(self.min_bound, dtype=float) + np.array([x, y, z], dtype=float) * self.voxel_size
+            # world -> planning local idx estimate (float)
+            idx_raw = (world - planning_origin_world) / self.voxel_size
+            # planning local idx = idx_raw - planning_min_index
+            idx_local = np.round(idx_raw - planning_min_index).astype(int)
+            # bounds check
+            if np.any(idx_local < 0) or np.any(idx_local >= planning_grid.shape):
+                return False
+            # require planning_grid True -> 可走
+            if not planning_grid[tuple(idx_local)]:
+                return False
+
+        return True
+
+    unit_dirs = self.unit_vectors
+    id2dir = self.id2dir
+    cos_table = self.cos_table
+    axis_penalty = self._compute_axis_turn_penalty
+    angle_penalty = self._compute_turn_penalty
+    z_penalty = self.z_penalty
+    turn_penalty = self.turn_penalty
+    min_cos_threshold = 0.25
+
+    # KDTree helper: input pt is in original safe-voxel index space (or world if flagged)
+    def find_nearest_planning_voxel(pt, k=5, kdtree_max_dist_vox=kdtree_max_dist):
+        """
+        返回候选的 orig-voxel 索引列表（tuple），
+        - pt: 给定点（原始 safe voxel index 或 world 坐标），我们认为它是原始 voxel 索引（3,)
+        - k: 尝试返回的邻居数
+        - kdtree_max_dist_vox: 最大允许的距离（单位：voxel index 单位）
+        """
+        if planning_kdtree is None or planning_true_voxels.shape[0] == 0:
+            return []
+
+        pt_arr = np.asarray(pt, dtype=float)
+
+        # 如果 pt 看起来像是 world 坐标（值远大于 planning_grid 尺度），先转为 orig voxel index
+        # 我们期望 pt 是原始 voxel index；如果它看起来像 float world （数值大），尝试 convert:
+        if pt_arr.max() > 1000 and hasattr(self.voxelization, "convert_point_to_voxel"):
+            # interpret as world coord
+            safe_idx = np.asarray(self.voxelization.convert_point_to_voxel(pt_arr), dtype=float)
+            pt_arr = safe_idx
+
+        # Convert safe-index -> world
+        world = np.asarray(self.min_bound, dtype=float) + pt_arr * self.voxel_size
+
+        # Convert world -> planning-local idx for KDTree query
+        q = (world - planning_origin_world) / self.voxel_size - planning_min_index
+        # q is planning-local (float). KDTree is built on planning_true_voxels (integers)
+        q = np.asarray(q, dtype=float)
+
+        k_query = min(k, planning_true_voxels.shape[0])
+        dist, ids = planning_kdtree.query(q, k=k_query)
+        if np.isscalar(ids):
+            ids = [ids]
+            dist = [dist]
+
+        candidates = []
+        for d, idx in zip(dist, ids):
+            # dist from KDTree is in planning-index units; enforce threshold
+            if np.isfinite(kdtree_max_dist_vox) and d > kdtree_max_dist_vox:
+                continue
+            # planning candidate (local index)
+            p_local = planning_true_voxels[int(idx)]
+            # convert candidate planning-local -> world -> orig voxel index
+            world_cand = planning_idx_to_world(p_local)
+            orig_cand = np.asarray(self.voxelization.convert_point_to_voxel(world_cand), dtype=int)
+            orig_cand_tuple = (int(orig_cand[0]), int(orig_cand[1]), int(orig_cand[2]))
+
+            # safety check: line collision between pt (orig voxel) and orig_cand
+            if line_collision_free(np.asarray(pt_arr, dtype=float), orig_cand, safe):
+                candidates.append(orig_cand_tuple)
+
+        return candidates
+
+    # build start / goal candidates (orig-voxel indices)
+    start_candidates = find_nearest_planning_voxel(start, k=5, kdtree_max_dist_vox=kdtree_max_dist)
+    goal_candidates = find_nearest_planning_voxel(goal, k=5, kdtree_max_dist_vox=kdtree_max_dist)
+    if len(start_candidates) == 0:
+        start_candidates = [tuple(map(int, start))]
+    if len(goal_candidates) == 0:
+        goal_candidates = [tuple(map(int, goal))]
+
+    step_count = 0
+    # ---- A* 主循环 ----
+    while openh:
+        step_count += 1
+        if step_count % 500 == 0:
+            cur_snapshot = openh[0][1].pos if len(openh) > 0 else None
+            print(f"[Step {step_count}] Open list size: {len(openh)}, Closed set size: {len(closed)}, Current node: {cur_snapshot}")
+
+        _, cur = heapq.heappop(openh)
+        cx, cy, cz = tuple(map(int, cur.pos))
+        key = make_key(cx, cy, cz, cur.dir_id)
+        if key in closed:
+            continue
+
+        # 到达任意 goal candidate 即视为到达目标（后续可细化判断）
+        if any((cx, cy, cz) == tuple(map(int, g)) for g in goal_candidates):
+            path = []
+            node = cur
+            while node:
+                path.append(tuple(map(int, node.pos)))
+                node = node.parent
+            path.reverse()
+            return path
+
+        closed.add(key)
+
+        # 26 邻居 + 延伸（延伸优先）
+        for dir_id, d_unit in enumerate(unit_dirs):
+            d = id2dir[dir_id]
+            # 方向剪枝
+            if cur.dir_vec is not None:
+                cos_dir = float(np.dot(cur.dir_vec, d_unit))
+                if cos_dir < min_cos_threshold:
+                    continue
+
+            # 尝试延伸到 max_extend_steps（优先走连续栅格）
+            next_pos = None
+            for step in range(1, max_extend_steps + 1):
+                nx = cx + int(d[0] * step)
+                ny = cy + int(d[1] * step)
+                nz = cz + int(d[2] * step)
+                if avail(nx, ny, nz):
+                    next_pos = (nx, ny, nz)
+                    if step_count % 500 == 0:
+                        print(f"[Extend] {cur.pos} -> {next_pos} (step {step})")
+                    break
+
+            # 延伸失败时，尝试 KDTree jump（寻找可连通的 planning voxel -> 转为原始 voxel）
+            if next_pos is None:
+                if planning_kdtree is None:
+                    continue
+                # query point: take one-step in that direction from current pos (orig-index)
+                q_pt = np.array([cx + d[0], cy + d[1], cz + d[2]], dtype=float)
+                candidates = find_nearest_planning_voxel(q_pt, k=8, kdtree_max_dist_vox=kdtree_max_dist)
+                if not candidates:
+                    continue
+                # choose the best candidate by distance along direction (prefer forward) and distance
+                # prefer candidate with smallest projection angle to d_unit and within kdtree_max_dist
+                best = None
+                best_score = None
+                for cand in candidates:
+                    vec = np.asarray(cand, dtype=float) - np.asarray([cx, cy, cz], dtype=float)
+                    dist = np.linalg.norm(vec)
+                    if dist < 1e-6:
+                        score = 1e6
+                    else:
+                        proj = (vec @ d_unit) / (dist + 1e-9)  # cos angle
+                        score = proj / (dist + 1e-6)  # prefer aligned and close
+                    if best is None or score > best_score:
+                        best = cand
+                        best_score = score
+                next_pos = tuple(map(int, best))
+                if step_count % 500 == 0:
+                    print(f"[KDTreeJump] {cur.pos} -> {next_pos} (score {best_score:.4f})")
+                # ensure the jump is collision-free along the segment (already checked in find_nearest)
+                # but we still re-check to be safe
+                if not line_collision_free(np.asarray([cx, cy, cz], dtype=float), np.asarray(next_pos, dtype=float), safe):
+                    continue
+
+            # 计算代价（用欧氏距离 + 角度罚项）
+            gnew = cur.g + np.linalg.norm(np.asarray(next_pos, dtype=float) - np.asarray([cx, cy, cz], dtype=float))
+            if cur.dir_vec is not None:
+                gnew += tangent_penalty_weight * (1.0 - float(np.dot(cur.dir_vec, d_unit)))
+            if cur.parent is None and start_tangent is not None:
+                gnew += boundary_penalty_weight * (1.0 - float(np.dot(np.asarray(start_tangent, dtype=float), d_unit)))
+            if self.is_close(next_pos, goal) and goal_tangent is not None:
+                gnew += boundary_penalty_weight * (1.0 - float(np.dot(np.asarray(goal_tangent, dtype=float), d_unit)))
+
+            gnew += axis_penalty(cur.dir_id, dir_id)
+            gnew += angle_penalty(cur.dir_id, dir_id)
+            if abs(d[2]) > 0:
+                gnew += z_penalty
+            if cur.dir_id is not None:
+                c = cos_table[cur.dir_id, dir_id]
+                if c < 0.95:
+                    gnew += (1.0 - c) * turn_penalty
+
+            hnew = heuristic(next_pos, goal)
+            fnew = gnew + hnew
+            state_key = make_key(*next_pos, dir_id)
+            if state_key not in openg or fnew < openg[state_key]:
+                node = Node(tuple(map(int, next_pos)), parent=cur, dir_id=dir_id, dir_vec=d_unit)
+                node.g, node.h, node.f = gnew, hnew, fnew
+                openg[state_key] = fnew
+                heapq.heappush(openh, (fnew, node))
+
+    # 没找到路径
+    return []
