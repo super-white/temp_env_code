@@ -1,0 +1,150 @@
+def _astar_safe_only(self, start_vox, goal_vox, safe,
+                         max_iter=5_000_000, verbose=False):
+        """
+        Safe-only A*（26邻域）：
+        - 输入/输出均为 原始 safe grid 的体素索引 (x,y,z) tuples 或可转成 int 的 array-like。
+        - 返回 path: list of (x,y,z) (原始体素坐标)。若不可达返回 None。
+        - 这是一个通用、较保守的实现：可作为 superedge 计算与 fallback。
+        """
+        import heapq
+        import numpy as np
+
+        start = tuple(int(v) for v in start_vox)
+        goal = tuple(int(v) for v in goal_vox)
+        shape = safe.shape
+
+        def in_bounds(p):
+            x, y, z = p
+            return (0 <= x < shape[0]) and (0 <= y < shape[1]) and (0 <= z < shape[2])
+
+        # quick rejection
+        if not in_bounds(start) or not in_bounds(goal):
+            if verbose:
+                logger.debug(f"_astar_safe_only: start/goal out of bounds start={start} goal={goal} shape={shape}")
+            return None
+        if safe[start]:
+            if verbose:
+                logger.debug(f"_astar_safe_only: start is occupied {start}")
+            return None
+        if safe[goal]:
+            if verbose:
+                logger.debug(f"_astar_safe_only: goal is occupied {goal}")
+            return None
+
+        # 26 dirs
+        dirs26 = [(dx, dy, dz) for dx in [-1, 0, 1] for dy in [-1, 0, 1] for dz in [-1, 0, 1]
+                  if not (dx == dy == dz == 0)]
+
+        def heuristic(a, b):
+            a = np.array(a, dtype=float); b = np.array(b, dtype=float)
+            return float(np.linalg.norm(a - b))
+
+        def make_key(p, dir_id):
+            # simple key ignoring dir to reduce state size (we only need position)
+            x, y, z = p
+            return (int(x), int(y), int(z))
+
+        openh = []
+        gscore = {}
+        came_from = {}
+
+        gscore[start] = 0.0
+        f0 = heuristic(start, goal)
+        heapq.heappush(openh, (f0, start))
+
+        it = 0
+        while openh:
+            it += 1
+            if it > max_iter:
+                if verbose:
+                    logger.warning(f"_astar_safe_only: reach max_iter {max_iter}")
+                return None
+
+            fcur, cur = heapq.heappop(openh)
+            if cur == goal:
+                # reconstruct
+                path = [cur]
+                while path[-1] in came_from:
+                    path.append(came_from[path[-1]])
+                path.reverse()
+                return path
+
+            # expand neighbors
+            cx, cy, cz = cur
+            for d in dirs26:
+                nx, ny, nz = cx + d[0], cy + d[1], cz + d[2]
+                n = (nx, ny, nz)
+                if not in_bounds(n):
+                    continue
+                # occupied?
+                if safe[n]:
+                    continue
+                tentative_g = gscore[cur] + np.linalg.norm(np.array(d))  # cost proportional to step length (1 or sqrt2 or sqrt3)
+                if n not in gscore or tentative_g < gscore[n]:
+                    gscore[n] = tentative_g
+                    came_from[n] = cur
+                    fval = tentative_g + heuristic(n, goal)
+                    heapq.heappush(openh, (fval, n))
+
+        # not found
+        return None
+
+    def _astar_fallback_safe_only(self, cid, safe, start, goal, start_tangent=None, goal_tangent=None):
+        """
+        兼容旧接口的 wrapper。返回值与原来 _astar 期望一致（若原来预期返回 (path, final_dir) ）
+        我这里返回 (path, final_dir) —— final_dir 用0向量。
+        """
+        path = self._astar_safe_only(start, goal, safe, verbose=True)
+        if path is None:
+            return [], np.zeros(3, dtype=float)
+        # compute final_dir
+        if len(path) >= 2:
+            last = np.array(path[-1], dtype=float)
+            prev = np.array(path[-2], dtype=float)
+            vec = last - prev
+            norm = np.linalg.norm(vec)
+            final_dir = vec / norm if norm > 1e-6 else np.zeros(3, dtype=float)
+        else:
+            final_dir = np.zeros(3, dtype=float)
+        return path, final_dir
+
+    def line_collision_free(self, orig_a, orig_b, obstacle_voxel, step_mm_factor=0.5):
+        """
+        快速两点直线采样检测碰撞（输入 orig_a/orig_b 都是 原始体素索引 或 world）
+        - 如果传入的 orig_a/ orig_b 为整数三元组，我们视为原始体素索引（与你的 safe 数组索引配套）
+        - obstacle_voxel: safe array (True=障碍)
+        - step_mm_factor: 以 voxel_size * factor 做采样间隔的系数（默认 0.5 -> 每半个 voxel 采样一次）
+        返回: True 表示两点之间无碰撞（在 safe 中）
+        """
+        import numpy as np
+
+        # 判断输入是体素索引还是 world 坐标：通过类型和范围难以完全判断，假定调用方传 orig (体素)
+        # 如果是浮点或长度>3 需要 convert_point_to_voxel，但我们假定 orig_* 为体素索引（与你之前用法保持一致）
+        a = np.asarray(orig_a, dtype=float)
+        b = np.asarray(orig_b, dtype=float)
+
+        # convert to world positions for distance calculation
+        # orig_voxel_to_world: orig voxel -> world mm
+        a_w = np.asarray(self.voxelization.min_bound, dtype=float) + a * self.voxel_size
+        b_w = np.asarray(self.voxelization.min_bound, dtype=float) + b * self.voxel_size
+
+        vec = b_w - a_w
+        L = np.linalg.norm(vec)
+        if L <= 0:
+            ai = np.round(a).astype(int)
+            # check in bounds
+            if (ai < 0).any() or ai[0] >= obstacle_voxel.shape[0] or ai[1] >= obstacle_voxel.shape[1] or ai[2] >= obstacle_voxel.shape[2]:
+                return False
+            return not bool(obstacle_voxel[ai[0], ai[1], ai[2]])
+
+        step = max(1, int(np.ceil((self.voxel_size * step_mm_factor) and (L / (self.voxel_size * step_mm_factor)))))
+        # sample along the segment
+        for t in np.linspace(0.0, 1.0, step + 1):
+            p_w = a_w + t * vec
+            # convert world -> orig voxel index
+            pi = np.asarray(self.voxelization.convert_point_to_voxel(p_w), dtype=int)
+            if (pi < 0).any() or pi[0] >= obstacle_voxel.shape[0] or pi[1] >= obstacle_voxel.shape[1] or pi[2] >= obstacle_voxel.shape[2]:
+                return False
+            if obstacle_voxel[pi[0], pi[1], pi[2]]:
+                return False
+        return True
