@@ -1,0 +1,252 @@
+import numpy as np
+import open3d as o3d
+from scipy.ndimage import distance_transform_edt, maximum_filter
+
+
+# -----------------------------
+# 距离场
+# -----------------------------
+def compute_distance_field(occupancy: np.ndarray):
+    free = ~occupancy
+    dist = distance_transform_edt(free)
+    return dist
+
+
+# -----------------------------
+# 骨架提取（带 min_clearance）
+# -----------------------------
+def extract_skeleton(dist: np.ndarray, min_clearance=3):
+    safe = dist >= min_clearance
+    if not np.any(safe):
+        return np.zeros_like(dist, dtype=bool), np.empty((0,3), dtype=int)
+
+    # ridge（带过滤）
+    local_max = (dist == maximum_filter(dist, size=3))
+    skel = safe & local_max
+    coords = np.argwhere(skel)
+    return skel, coords
+
+
+# -----------------------------
+# 建图
+# -----------------------------
+def build_skeleton_graph(skeleton_mask):
+    idx_map = -np.ones_like(skeleton_mask, dtype=np.int32)
+    coords = np.argwhere(skeleton_mask)
+
+    for i, (x,y,z) in enumerate(coords):
+        idx_map[x,y,z] = i
+
+    graph = [[] for _ in range(len(coords))]
+    neigh = [(dx,dy,dz)
+             for dx in (-1,0,1)
+             for dy in (-1,0,1)
+             for dz in (-1,0,1)
+             if not (dx==0 and dy==0 and dz==0)]
+
+    for i,(x,y,z) in enumerate(coords):
+        for dx,dy,dz in neigh:
+            nx,ny,nz = x+dx, y+dy, z+dz
+            if 0<=nx<idx_map.shape[0] and 0<=ny<idx_map.shape[1] and 0<=nz<idx_map.shape[2]:
+                j = idx_map[nx,ny,nz]
+                if j>=0:
+                    graph[i].append(j)
+
+    return graph, coords
+
+
+# -----------------------------
+# Dijkstra
+# -----------------------------
+from heapq import heappush, heappop
+def dijkstra(graph, start, goal):
+    N = len(graph)
+    dist = [1e9]*N
+    prev = [-1]*N
+    dist[start]=0
+
+    pq=[]
+    heappush(pq,(0,start))
+
+    while pq:
+        d,u = heappop(pq)
+        if u==goal:
+            break
+        if d != dist[u]:
+            continue
+        
+        for v in graph[u]:
+            nd = d+1
+            if nd < dist[v]:
+                dist[v]=nd
+                prev[v]=u
+                heappush(pq,(nd,v))
+
+    if dist[goal]>=1e9:
+        return None
+
+    # reconstruct
+    path=[]
+    cur=goal
+    while cur!=-1:
+        path.append(cur)
+        cur=prev[cur]
+    return path[::-1]
+
+
+# -----------------------------
+# K shortest paths
+# -----------------------------
+def k_shortest_paths(graph, start, goal, k=3):
+    first = dijkstra(graph, start, goal)
+    if first is None:
+        return []
+
+    paths = [first]
+    candidates = []
+
+    for _ in range(1, k):
+        for i in range(len(paths[-1])-1):
+            spur_node = paths[-1][i]
+            root_path = paths[-1][:i+1]
+
+            removed_edges=[]
+            for p in paths:
+                if len(p)>i and p[:i+1]==root_path:
+                    u = p[i]
+                    v = p[i+1]
+                    if v in graph[u]:
+                        graph[u].remove(v)
+                        removed_edges.append((u,v))
+
+            spur_path = dijkstra(graph, spur_node, goal)
+            if spur_path is not None:
+                total = root_path[:-1] + spur_path
+                candidates.append(total)
+
+            for (u,v) in removed_edges:
+                graph[u].append(v)
+
+        if not candidates:
+            break
+
+        new_path = sorted(candidates, key=len)[0]
+        paths.append(new_path)
+        candidates.clear()
+
+    return paths
+
+
+# ================================================================
+# ⭐ 主函数（含完整可视化）
+# ================================================================
+class PathTopologyService:
+
+    @staticmethod
+    def extract_channels_visual(
+        occupancy,
+        start_voxel,
+        goal_voxel,
+        k=3,
+        min_clearance=3
+    ):
+        print("===== Step 1: 计算距离场 =====")
+        dist = compute_distance_field(occupancy)
+
+        print("===== Step 2: 提取可通行区域 (safe) =====")
+        safe = dist >= min_clearance
+
+        # 可视化 safe 区域
+        safe_pts = np.argwhere(safe)
+        pc_safe = o3d.geometry.PointCloud()
+        pc_safe.points = o3d.utility.Vector3dVector(safe_pts)
+        pc_safe.paint_uniform_color([0.8, 0.8, 0.8])  # 灰色
+
+        print(f"[safe] 点数 = {len(safe_pts)}")
+
+        print("===== Step 3: 提取骨架 =====")
+        skel_mask, skel_coords = extract_skeleton(dist, min_clearance=min_clearance)
+
+        pc_skel = o3d.geometry.PointCloud()
+        pc_skel.points = o3d.utility.Vector3dVector(skel_coords)
+        pc_skel.paint_uniform_color([0.0, 1.0, 0.0])  # 绿色
+
+        print(f"[skeleton] 点数 = {len(skel_coords)}")
+
+        # ----------------- 起点终点展示 -----------------
+        start_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=2)
+        start_sphere.translate(start_voxel)
+        start_sphere.paint_uniform_color([1,0,0])  # Red
+
+        goal_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=2)
+        goal_sphere.translate(goal_voxel)
+        goal_sphere.paint_uniform_color([0,0,1])  # Blue
+
+        print("===== Step 4: 构建骨架图 =====")
+        graph, coords = build_skeleton_graph(skel_mask)
+
+        if len(coords)==0:
+            print("⚠ skeleton 为空，无法找通道")
+            o3d.visualization.draw_geometries(
+                [pc_safe, start_sphere, goal_sphere]
+            )
+            return []
+
+        # ----------------- 最近骨架点 -----------------
+        def nearest_skel(pt):
+            d = np.sum((coords - pt)**2, axis=1)
+            return int(np.argmin(d))
+
+        s = nearest_skel(np.array(start_voxel))
+        g = nearest_skel(np.array(goal_voxel))
+
+        start_skel_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=1.5)
+        start_skel_sphere.translate(coords[s])
+        start_skel_sphere.paint_uniform_color([1, 0.6, 0])  # orange
+
+        goal_skel_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=1.5)
+        goal_skel_sphere.translate(coords[g])
+        goal_skel_sphere.paint_uniform_color([0, 0.6, 1])  # cyan
+
+        print(f"[Nearest skeleton] start_skel={coords[s]}, goal_skel={coords[g]}")
+
+        print("===== Step 5: K 最短路径 =====")
+        paths = k_shortest_paths(graph, s, g, k=k)
+
+        # 如果为空 —— 可视化告诉你为什么走不到
+        if len(paths) == 0:
+            print("⚠ path为空，请观察 skeleton 和 safe 是否断裂")
+            o3d.visualization.draw_geometries(
+                [pc_safe, pc_skel, start_sphere, goal_sphere, start_skel_sphere, goal_skel_sphere]
+            )
+            return []
+
+        print(f"找到 {len(paths)} 条通道")
+
+        # ------------------------------
+        # 可视化每条路径
+        # ------------------------------
+        channels = []
+        line_sets = []
+
+        for idx, p in enumerate(paths):
+            voxels = [coords[i] for i in p]
+            channels.append(voxels)
+
+            # line set
+            pts = np.array(voxels)
+            lines = [[i, i+1] for i in range(len(pts)-1)]
+            ls = o3d.geometry.LineSet(
+                points=o3d.utility.Vector3dVector(pts),
+                lines=o3d.utility.Vector2iVector(lines)
+            )
+            color = np.random.rand(3)
+            ls.colors = o3d.utility.Vector3dVector([color for _ in lines])
+            line_sets.append(ls)
+
+        print("===== Step 6: Open3D 展示最终通道 =====")
+        o3d.visualization.draw_geometries(
+            [pc_safe, pc_skel, start_sphere, goal_sphere, start_skel_sphere, goal_skel_sphere, *line_sets]
+        )
+
+        return channels
