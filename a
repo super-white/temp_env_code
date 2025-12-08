@@ -1,0 +1,346 @@
+# planning_lattice.py
+import numpy as np
+import heapq
+from typing import List, Tuple, Dict, Optional
+
+# optional visualization
+try:
+    import open3d as o3d
+    _HAS_O3D = True
+except Exception:
+    _HAS_O3D = False
+
+
+def build_block_centers(planning_grid: np.ndarray,
+                        voxel_size: float,
+                        planning_origin_world: np.ndarray,
+                        planning_min_index: np.ndarray,
+                        block_size: int = 5) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    将 planning_grid 分成 block，并为每个包含可走体素的 block 返回一个中心体素索引。
+    返回:
+      centers_idx: (N,3) array of planning-grid indices (integers, 相对于 planning_grid 的坐标系)
+      centers_world: (N,3) array world coordinates (mm)
+    参数:
+      planning_origin_world: world 坐标系中 planning-grid 原点 (shape (3,))
+      planning_min_index: planning-grid 在 global idx 上的 min_index（通常为 zeros 或者和原始 min_bound 对齐）
+    """
+    assert planning_grid.ndim == 3
+    sx, sy, sz = planning_grid.shape
+    blocks_x = int(np.ceil(sx / block_size))
+    blocks_y = int(np.ceil(sy / block_size))
+    blocks_z = int(np.ceil(sz / block_size))
+
+    centers_idx = []
+    centers_world = []
+    for bx in range(blocks_x):
+        x0 = bx * block_size
+        x1 = min(sx, x0 + block_size)
+        for by in range(blocks_y):
+            y0 = by * block_size
+            y1 = min(sy, y0 + block_size)
+            for bz in range(blocks_z):
+                z0 = bz * block_size
+                z1 = min(sz, z0 + block_size)
+                block = planning_grid[x0:x1, y0:y1, z0:z1]
+                if np.any(block):
+                    # choose block center index (floor middle)
+                    cx = (x0 + x1 - 1) // 2
+                    cy = (y0 + y1 - 1) // 2
+                    cz = (z0 + z1 - 1) // 2
+                    centers_idx.append((cx, cy, cz))
+                    # world: planning_origin_world + (planning_min_index + idx) * voxel_size
+                    world = planning_origin_world + (planning_min_index + np.array([cx, cy, cz], dtype=float)) * voxel_size
+                    centers_world.append(world)
+    if len(centers_idx) == 0:
+        return np.zeros((0, 3), dtype=int), np.zeros((0, 3), dtype=float)
+    return np.array(centers_idx, dtype=int), np.array(centers_world, dtype=float)
+
+
+def index_line_clear(a_idx: Tuple[int, int, int], b_idx: Tuple[int, int, int],
+                     planning_grid: np.ndarray) -> bool:
+    """
+    在 planning_grid 的 index 空间上，对 a_idx->b_idx 做离散直线采样，
+    要求采样点全部为 True（planning_grid 的 True 表示“可走”）。
+    返回 True 表示两点之间通过（可连通）。
+    """
+    a = np.array(a_idx, dtype=float)
+    b = np.array(b_idx, dtype=float)
+    diff = b - a
+    steps = int(np.ceil(np.max(np.abs(diff))))
+    steps = max(1, steps)
+    for t in np.linspace(0.0, 1.0, steps + 1):
+        p = a + t * diff
+        pi = np.round(p).astype(int)
+        if (pi < 0).any() or pi[0] >= planning_grid.shape[0] or pi[1] >= planning_grid.shape[1] or pi[2] >= planning_grid.shape[2]:
+            return False
+        if not bool(planning_grid[pi[0], pi[1], pi[2]]):
+            return False
+    return True
+
+
+def build_center_graph(centers_idx: np.ndarray,
+                       planning_grid: np.ndarray,
+                       connectivity: int = 6) -> Tuple[Dict[int, List[Tuple[int, float]]], Dict[int, Tuple[int, int, int]]]:
+    """
+    基于 centers_idx (N,3) 构建稀疏邻接表图。
+    connectivity: 6/18/26 对应邻域类型（默认 6）
+    返回:
+      adj: dict node_id -> list of (neighbor_id, weight)
+      id2idx: dict node_id -> planning idx tuple
+    """
+    assert connectivity in (6, 18, 26)
+    N = len(centers_idx)
+    id2idx = {i: tuple(centers_idx[i]) for i in range(N)}
+    # map index -> id for quick spatial lookup
+    idx_to_id = {tuple(centers_idx[i]): i for i in range(N)}
+
+    # neighbor offsets in block-grid (we allow neighbors in manhattan distance <=1)
+    neigh = []
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for dz in (-1, 0, 1):
+                if dx == 0 and dy == 0 and dz == 0:
+                    continue
+                if connectivity == 6 and sum(map(abs, (dx, dy, dz))) != 1:
+                    continue
+                # for 18 and 26 allow more
+                neigh.append((dx, dy, dz))
+
+    adj = {i: [] for i in range(N)}
+
+    # Build a spatial KD-like acceleration: bucket by rounding to center coordinate divided by 1 (we already have direct idx_to_id)
+    # We'll simply try neighbors by scanning all other nodes whose planning idx difference <=1 in block-grid units.
+    # Build a mapping from integer planning idx to node id is idx_to_id already.
+
+    for i in range(N):
+        xi, yi, zi = id2idx[i]
+        # try to connect to any center that lies in neighboring planning idx offsets (this is conservative)
+        for dx, dy, dz in neigh:
+            nb = (xi + dx, yi + dy, zi + dz)
+            j = idx_to_id.get(nb)
+            if j is None:
+                # not exact neighbor center: still try to connect to nearby centers within small radius (1..2)
+                # try radius 2 if connectivity >6
+                continue
+            if j == i:
+                continue
+            # verify line collision in planning-grid index space
+            if index_line_clear(id2idx[i], id2idx[j], planning_grid):
+                # weight = euclidean distance in planning idx (convert to mm later if needed)
+                w = float(np.linalg.norm(np.array(id2idx[i], dtype=float) - np.array(id2idx[j], dtype=float)))
+                adj[i].append((j, w))
+                # append reverse
+                adj[j].append((i, w))
+    return adj, id2idx
+
+
+# Dijkstra for shortest path (returns node id path)
+def dijkstra_path(adj: Dict[int, List[Tuple[int, float]]], source: int, target: int) -> Optional[List[int]]:
+    pq = []
+    heapq.heappush(pq, (0.0, source))
+    dist = {source: 0.0}
+    prev = {}
+    visited = set()
+    while pq:
+        d, u = heapq.heappop(pq)
+        if u in visited:
+            continue
+        visited.add(u)
+        if u == target:
+            # reconstruct
+            path = [u]
+            while path[-1] != source:
+                path.append(prev[path[-1]])
+            return path[::-1]
+        for v, w in adj.get(u, []):
+            nd = d + w
+            if v not in dist or nd < dist[v]:
+                dist[v] = nd
+                prev[v] = u
+                heapq.heappush(pq, (nd, v))
+    return None
+
+
+# 简单实现 Yen's K-shortest simple paths（基于 dijkstra_path）
+def yen_k_shortest(adj: Dict[int, List[Tuple[int, float]]], source: int, target: int, K: int = 3) -> List[List[int]]:
+    # first shortest
+    A = []
+    B = []
+    p0 = dijkstra_path(adj, source, target)
+    if p0 is None:
+        return []
+    A.append(p0)
+    for k in range(1, K):
+        for i in range(len(A[-1]) - 1):
+            spur_node = A[-1][i]
+            root_path = A[-1][:i + 1]  # nodes list
+            removed_edges = []
+            removed_nodes = set()
+            # remove the edges that share the same root_path from graph copy
+            for p in A:
+                if len(p) > i and p[:i + 1] == root_path:
+                    u = p[i]
+                    v = p[i + 1]
+                    # remove edge u->v
+                    # we'll mutate adj temporarily by marking
+                    # store and remove
+                    for idx, (nbr, w) in enumerate(adj.get(u, [])):
+                        if nbr == v:
+                            removed_edges.append((u, v, adj[u][idx]))
+                            del adj[u][idx]
+                            break
+            # remove nodes in root_path except spur_node
+            for rn in root_path[:-1]:
+                if rn in adj:
+                    removed_nodes.add(rn)
+                    saved = adj.pop(rn)
+                    removed_edges.append(('__node__', rn, saved))
+
+            spur_path = dijkstra_path(adj, spur_node, target)
+            if spur_path is not None:
+                total_path = root_path[:-1] + spur_path
+                # avoid duplicates
+                if total_path not in B:
+                    # cost compute
+                    cost = 0.0
+                    for a, b in zip(total_path[:-1], total_path[1:]):
+                        # find weight
+                        for nb, w in adj.get(a, []):
+                            if nb == b:
+                                cost += w
+                                break
+                    B.append((cost, total_path))
+            # restore removed edges/nodes
+            for item in removed_edges:
+                if item[0] == '__node__':
+                    adj[item[1]] = item[2]
+                else:
+                    u, v, tup = item
+                    if u not in adj:
+                        adj[u] = []
+                    adj[u].append(tup)
+        if not B:
+            break
+        # pick shortest candidate
+        B.sort(key=lambda x: x[0])
+        _, p_new = B.pop(0)
+        A.append(p_new)
+    return A
+
+
+# Visualization helper using open3d
+def visualize_planning_and_paths(planning_grid: np.ndarray,
+                                 centers_idx: np.ndarray,
+                                 centers_world: np.ndarray,
+                                 paths_node_lists: List[List[int]],
+                                 id2idx: Dict[int, Tuple[int, int, int]],
+                                 planning_origin_world: np.ndarray,
+                                 planning_min_index: np.ndarray,
+                                 voxel_size: float,
+                                 highlight_nodes: List[int] = None):
+    """
+    展示 planning_grid (as points), centers (blue spheres), and paths (red spheres/lines).
+    highlight_nodes: list of node ids to render bigger/colored.
+    """
+    if not _HAS_O3D:
+        print("open3d not available; skip visualization")
+        return
+
+    vis_items = []
+
+    # planning voxels -> point cloud (sparse sampling to avoid huge render)
+    voxels = np.argwhere(planning_grid)
+    if len(voxels) > 0:
+        # convert to world for display
+        vox_world = planning_origin_world + (planning_min_index + voxels.astype(float)) * voxel_size
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(vox_world)
+        pcd.paint_uniform_color([0.8, 0.8, 0.8])
+        vis_items.append(pcd)
+
+    # centers -> small blue spheres
+    for nid, w in enumerate(centers_world):
+        s = o3d.geometry.TriangleMesh.create_sphere(radius=voxel_size * 0.4)
+        s.translate(w)
+        s.paint_uniform_color([0.0, 0.0, 1.0])
+        vis_items.append(s)
+
+    # paths
+    colors = [[1, 0, 0], [1, 0.6, 0], [0, 1, 0]]
+    for pi, path in enumerate(paths_node_lists):
+        color = colors[pi % len(colors)]
+        for nid in path:
+            w = centers_world[nid]
+            s = o3d.geometry.TriangleMesh.create_sphere(radius=voxel_size * 0.6)
+            s.translate(w)
+            s.paint_uniform_color(color)
+            vis_items.append(s)
+        # optionally connect with lines
+        if len(path) >= 2:
+            lines = []
+            pts = []
+            for nid in path:
+                pts.append(list(centers_world[nid]))
+            lines_np = np.array([[i, i + 1] for i in range(len(pts) - 1)], dtype=int)
+            line_set = o3d.geometry.LineSet(
+                points=o3d.utility.Vector3dVector(np.array(pts)),
+                lines=o3d.utility.Vector2iVector(lines_np)
+            )
+            line_set.colors = o3d.utility.Vector3dVector([color for _ in range(len(lines_np))])
+            vis_items.append(line_set)
+
+    # highlight nodes
+    if highlight_nodes:
+        for nid in highlight_nodes:
+            w = centers_world[nid]
+            s = o3d.geometry.TriangleMesh.create_sphere(radius=voxel_size * 0.9)
+            s.translate(w)
+            s.paint_uniform_color([0, 1, 1])  # cyan
+            vis_items.append(s)
+
+    o3d.visualization.draw_geometries(vis_items)
+
+
+# -------------------------
+# Usage helper
+# -------------------------
+def build_lattice_and_k_paths(planning_grid: np.ndarray,
+                              voxel_size: float,
+                              planning_origin_world: Optional[np.ndarray] = None,
+                              planning_min_index: Optional[np.ndarray] = None,
+                              block_size: int = 5,
+                              connectivity: int = 6,
+                              k_paths: int = 3):
+    """
+    Convenience wrapper:
+      1) build centers
+      2) build graph
+      3) compute k shortest center-node paths between centers nearest to start/goal
+    Returns a dict with centers_idx, centers_world, adj, id2idx, paths (list of node-id lists)
+    """
+    if planning_origin_world is None:
+        planning_origin_world = np.zeros(3, dtype=float)
+    if planning_min_index is None:
+        planning_min_index = np.zeros(3, dtype=int)
+
+    centers_idx, centers_world = build_block_centers(planning_grid, voxel_size,
+                                                     np.asarray(planning_origin_world, dtype=float),
+                                                     np.asarray(planning_min_index, dtype=float),
+                                                     block_size=block_size)
+    if len(centers_idx) == 0:
+        return {"centers_idx": centers_idx, "centers_world": centers_world, "adj": {}, "id2idx": {}, "paths": []}
+
+    adj, id2idx = build_center_graph(centers_idx, planning_grid, connectivity=connectivity)
+
+    # no nodes? return
+    if len(adj) == 0:
+        return {"centers_idx": centers_idx, "centers_world": centers_world, "adj": adj, "id2idx": id2idx, "paths": []}
+
+    # build KD-tree over centers_idx (simple numpy)
+    from scipy.spatial import cKDTree
+    kdt = cKDTree(centers_idx.astype(float))
+
+    out = {"centers_idx": centers_idx, "centers_world": centers_world, "adj": adj, "id2idx": id2idx, "paths": []}
+
+    return out
