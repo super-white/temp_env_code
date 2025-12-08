@@ -1,0 +1,436 @@
+# domain/planner/coarse_planner.py
+import numpy as np
+from scipy.spatial import cKDTree
+import heapq
+from typing import List, Tuple, Dict, Any, Optional
+
+try:
+    import open3d as o3d
+    _HAS_O3D = True
+except Exception:
+    _HAS_O3D = False
+
+
+class CoarseRoutePlanner:
+    """
+    粗粒度分区 + 中心点路径候选生成器。
+    依赖：
+      - planning_grid: np.ndarray bool (True = planning 可走)
+      - planning_voxel_origin: np.array([x,y,z]) 世界坐标（mm），对应 planning_grid 索引 (0,0,0) 的 world
+      - planning_min_index: np.array([ix,iy,iz]) planning_grid 在 global voxel idx 的最小索引（通常与 origin 对齐或 zeros）
+      - voxel_size: float (mm)
+      - voxelization: 一个对象，至少提供方法 convert_point_to_voxel(world_point)->voxel_idx (用于 line collision 检测) 
+                     并包含 min_bound 属性（用于 orig_voxel <-> world）
+    输出：多个 candidate route（每条由中心 world 点串成）
+    """
+
+    def __init__(self,
+                 voxelization,
+                 planning_grid: np.ndarray,
+                 planning_voxel_origin: np.ndarray,
+                 planning_min_index: np.ndarray,
+                 voxel_size: float):
+        self.voxelization = voxelization
+        self.planning_grid = planning_grid
+        self.planning_voxel_origin = np.asarray(planning_voxel_origin, dtype=float)
+        self.planning_min_index = np.asarray(planning_min_index, dtype=int)
+        self.voxel_size = float(voxel_size)
+        # precompute planning true voxels & kd-tree
+        self.planning_true_voxels = np.argwhere(self.planning_grid)
+        if len(self.planning_true_voxels) > 0:
+            self._planning_kdtree = cKDTree(self.planning_true_voxels.astype(float))
+        else:
+            self._planning_kdtree = None
+
+    # ---------------- utilities ----------------
+    def planning_idx_to_world(self, pidx: Tuple[int, int, int]) -> np.ndarray:
+        # pidx is planning-grid index (relative to planning_grid)
+        return self.planning_voxel_origin + (self.planning_min_index + np.asarray(pidx, dtype=float)) * self.voxel_size
+
+    def orig_voxel_to_world(self, orig_vox: Tuple[int, int, int]) -> np.ndarray:
+        # orig_vox: 原始体素索引（对应 voxelization.min_bound）
+        return np.asarray(self.voxelization.min_bound, dtype=float) + np.asarray(orig_vox, dtype=float) * self.voxel_size
+
+    def world_to_orig_voxel(self, world_pt: np.ndarray) -> Tuple[int, int, int]:
+        return tuple(self.voxelization.convert_point_to_voxel(np.asarray(world_pt, dtype=float)).astype(int))
+
+    def line_collision_ratio(self, world_a: np.ndarray, world_b: np.ndarray, obstacle_voxel: np.ndarray,
+                             step_mm: float = None) -> float:
+        """
+        沿 world_a->world_b 等距采样，返回采样点中落在 obstacle_voxel(True=障碍) 的比例 (0..1).
+        step_mm: 每隔多少 mm 采样；默认使用 voxel_size * 0.5
+        """
+        if step_mm is None:
+            step_mm = max(0.5 * self.voxel_size, 1.0)
+        a_w = np.asarray(world_a, dtype=float)
+        b_w = np.asarray(world_b, dtype=float)
+        vec = b_w - a_w
+        L = np.linalg.norm(vec)
+        if L <= 0:
+            # single point check
+            pi = np.asarray(self.voxelization.convert_point_to_voxel(a_w), dtype=int)
+            if (pi < 0).any() or pi[0] >= obstacle_voxel.shape[0] or pi[1] >= obstacle_voxel.shape[1] or pi[2] >= obstacle_voxel.shape[2]:
+                return 1.0
+            return 1.0 if obstacle_voxel[pi[0], pi[1], pi[2]] else 0.0
+
+        steps = max(1, int(np.ceil(L / step_mm)))
+        hits = 0
+        total = steps + 1
+        for t in np.linspace(0.0, 1.0, steps + 1):
+            p = a_w + t * vec
+            pi = np.asarray(self.voxelization.convert_point_to_voxel(p), dtype=int)
+            if (pi < 0).any() or pi[0] >= obstacle_voxel.shape[0] or pi[1] >= obstacle_voxel.shape[1] or pi[2] >= obstacle_voxel.shape[2]:
+                hits += 1  # out of bounds 当作碰撞
+            else:
+                if obstacle_voxel[pi[0], pi[1], pi[2]]:
+                    hits += 1
+        return float(hits) / float(total)
+
+    def line_collision_free(self, world_a: np.ndarray, world_b: np.ndarray, obstacle_voxel: np.ndarray,
+                            threshold_ratio: float = 0.0) -> bool:
+        """判断两点间的干涉比例是否 <= threshold_ratio"""
+        r = self.line_collision_ratio(world_a, world_b, obstacle_voxel)
+        return r <= threshold_ratio
+
+    # ---------------- build coarse cells ----------------
+    def build_coarse_centers(self, coarse_cell_mm: float, min_points_in_cell: int = 1,
+                             max_search_radius_vox: int = 3) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        将 planning_grid 按 coarse_cell_mm 划分，取每个 cell 的代表 planning_idx（保证在 planning_grid=True 内）
+        返回:
+          centers_idx: (N,3) planning-grid 索引数组 (int)
+          centers_world: (N,3) 对应 world 坐标 (float mm)
+        策略:
+          - 计算 block 大小（vox），在 block 中取中点 pcenter_idx（block coord）
+          - 如果 pcenter_idx 对应 planning_grid 为 True，直接取；否则在 block 内找距离中心最近的 planning true voxel（限 radius）
+          - 若 block 内无 planning voxel 则丢弃该 block
+        """
+        assert coarse_cell_mm > 0
+        cell_vox = max(1, int(round(coarse_cell_mm / self.voxel_size)))
+        sx, sy, sz = self.planning_grid.shape
+        bx = int(np.ceil(sx / cell_vox))
+        by = int(np.ceil(sy / cell_vox))
+        bz = int(np.ceil(sz / cell_vox))
+
+        centers_idx = []
+        centers_world = []
+
+        # kd-tree over planning_true_voxels for local search
+        if self._planning_kdtree is None:
+            return np.zeros((0, 3), dtype=int), np.zeros((0, 3), dtype=float)
+
+        for i in range(bx):
+            x0 = i * cell_vox
+            x1 = min(sx, x0 + cell_vox)
+            cx = (x0 + x1 - 1) // 2
+            for j in range(by):
+                y0 = j * cell_vox
+                y1 = min(sy, y0 + cell_vox)
+                cy = (y0 + y1 - 1) // 2
+                for k in range(bz):
+                    z0 = k * cell_vox
+                    z1 = min(sz, z0 + cell_vox)
+                    cz = (z0 + z1 - 1) // 2
+                    center = (cx, cy, cz)
+                    # 如果中心可走，取之
+                    if 0 <= cx < sx and 0 <= cy < sy and 0 <= cz < sz and self.planning_grid[cx, cy, cz]:
+                        centers_idx.append(center)
+                        centers_world.append(self.planning_idx_to_world(center))
+                        continue
+                    # 否则在 block 内查找最近 planning voxel（KDTree query）
+                    # 将 block bounding box 转成点查询中心点
+                    center_arr = np.array(center, dtype=float)
+                    # query nearest planning voxels (a few)
+                    dists, ids = self._planning_kdtree.query(center_arr, k=8, distance_upper_bound=(max_search_radius_vox * max(cell_vox,1)))
+                    if np.isscalar(ids):
+                        ids = [ids]; dists = [dists]
+                    found = False
+                    for dd, idx in zip(np.atleast_1d(dists), np.atleast_1d(ids)):
+                        if idx == self._planning_kdtree.n:  # no more
+                            continue
+                        p = tuple(self.planning_true_voxels[int(idx)])
+                        # check p lies inside this block bounding indices
+                        if x0 <= p[0] < x1 and y0 <= p[1] < y1 and z0 <= p[2] < z1:
+                            centers_idx.append(p)
+                            centers_world.append(self.planning_idx_to_world(p))
+                            found = True
+                            break
+                    # discard if not found
+        if len(centers_idx) == 0:
+            return np.zeros((0, 3), dtype=int), np.zeros((0, 3), dtype=float)
+        return np.array(centers_idx, dtype=int), np.array(centers_world, dtype=float)
+
+    # ---------------- build adjacency graph ----------------
+    def build_center_graph(self, centers_world: np.ndarray, min_span_mm: float, max_span_mm: float) -> Dict[int, List[Tuple[int, float]]]:
+        """
+        centers_world: (N,3) world coords
+        edges between centers if distance in [min_span_mm, max_span_mm]
+        返回邻接表 {id: [(neighbor_id, weight_mm), ...], ...}
+        """
+        N = len(centers_world)
+        if N == 0:
+            return {}
+        kdt = cKDTree(centers_world.astype(float))
+        adj = {i: [] for i in range(N)}
+        # for each center query neighbors within max_span_mm
+        for i in range(N):
+            pts = centers_world[i]
+            ids = kdt.query_ball_point(pts, r=max_span_mm)
+            for j in ids:
+                if j == i:
+                    continue
+                d = float(np.linalg.norm(centers_world[i] - centers_world[j]))
+                if d >= min_span_mm and d <= max_span_mm:
+                    adj[i].append((j, d))
+        return adj
+
+    # ---------------- path search (Yen simplified) ----------------
+    def dijkstra_nodes(self, adj: Dict[int, List[Tuple[int, float]]], source: int, target: int) -> Optional[List[int]]:
+        pq = []
+        heapq.heappush(pq, (0.0, source))
+        dist = {source: 0.0}
+        prev = {}
+        visited = set()
+        while pq:
+            d, u = heapq.heappop(pq)
+            if u in visited:
+                continue
+            visited.add(u)
+            if u == target:
+                path = [u]
+                while path[-1] != source:
+                    path.append(prev[path[-1]])
+                return path[::-1]
+            for v, w in adj.get(u, []):
+                nd = d + w
+                if v not in dist or nd < dist[v]:
+                    dist[v] = nd
+                    prev[v] = u
+                    heapq.heappush(pq, (nd, v))
+        return None
+
+    def yen_k_shortest_nodes(self, adj: Dict[int, List[Tuple[int, float]]], source: int, target: int, K: int = 3) -> List[List[int]]:
+        A = []
+        first = self.dijkstra_nodes(adj, source, target)
+        if first is None:
+            return []
+        A.append(first)
+        B = []
+        for k in range(1, K):
+            for i in range(len(A[-1]) - 1):
+                spur = A[-1][i]
+                root = A[-1][:i+1]
+                removed = []
+                for p in A:
+                    if len(p) > i and p[:i+1] == root:
+                        u = p[i]
+                        v = p[i+1]
+                        # remove edge u->v by filtering (we'll restore later)
+                        for idx, (nb, w) in enumerate(adj[u]):
+                            if nb == v:
+                                removed.append((u, (nb, w)))
+                                adj[u].pop(idx)
+                                break
+                spur_path = self.dijkstra_nodes(adj, spur, target)
+                if spur_path is not None:
+                    candidate = root[:-1] + spur_path
+                    if candidate not in B:
+                        B.append(candidate)
+                # restore removed
+                for (u, edge) in removed:
+                    adj[u].append(edge)
+            if not B:
+                break
+            # pick shortest candidate
+            B.sort(key=lambda p: sum(np.linalg.norm(np.array(centers_world[i]) - np.array(centers_world[j])) for i, j in zip(p[:-1], p[1:])))
+            A.append(B.pop(0))
+            B.clear()
+        return A
+
+    # ---------------- main API ----------------
+    def generate_candidate_routes(self,
+                                  start_orig: Tuple[int, int, int],
+                                  goal_orig: Tuple[int, int, int],
+                                  coarse_cell_mm: float = 300.0,
+                                  min_span_mm: float = 250.0,
+                                  max_span_mm: float = 350.0,
+                                  top_k_paths: int = 5,
+                                  obstacle_voxel: Optional[np.ndarray] = None,
+                                  collision_threshold_ratio: float = 0.05,
+                                  weight_length: float = 0.5,
+                                  weight_interf: float = 0.5) -> List[Dict[str, Any]]:
+        """
+        生成候选大路径（直线段过中心点序列），并评分排序返回 top_k_paths。
+        start_orig / goal_orig: 原始体素索引 (x,y,z) - int tuple，与你现有 convert_point_to_voxel 配套
+        obstacle_voxel: 原始障碍体素数组 (True=障碍). 若为 None，则使用 self.voxelization.voxel_array 若存在
+        返回：list of dict:
+          {
+            'centers_idx': [(...), ...],        # planning idx chain
+            'centers_world': [np.array(...),...],
+            'segments': [(w0,w1),(w1,w2),...], # world points
+            'length_mm': total_length,
+            'interf_ratio': overall_interference_ratio,
+            'score': score
+          }
+        """
+        if obstacle_voxel is None:
+            obstacle_voxel = getattr(self.voxelization, "voxel_array", None)
+            if obstacle_voxel is None:
+                raise RuntimeError("需要 obstacle_voxel 或 voxelization.voxel_array")
+
+        # 1) build centers
+        centers_idx, centers_world = self.build_coarse_centers(coarse_cell_mm)
+        if len(centers_idx) == 0:
+            return []
+
+        # 2) build adjacency graph
+        adj = self.build_center_graph(centers_world, min_span_mm, max_span_mm)
+        if not adj:
+            return []
+
+        # 3) map start/goal -> nearest reachable center nodes
+        start_world = self.orig_voxel_to_world(start_orig)
+        goal_world = self.orig_voxel_to_world(goal_orig)
+
+        # query nearest center index by world distance (but require line collision free from start->center)
+        center_kdt = cKDTree(centers_world)
+        # search up to some neighbors to find reachable centers
+        def find_reachable_centers(world_pt, max_try=10):
+            dists, ids = center_kdt.query(world_pt, k=min(max_try, len(centers_world)))
+            if np.isscalar(ids):
+                ids = [ids]; dists = [dists]
+            reachable = []
+            for id_ in np.atleast_1d(ids):
+                idx = int(id_)
+                cw = centers_world[idx]
+                # require low collision ratio
+                if self.line_collision_free(world_pt, cw, obstacle_voxel, threshold_ratio=collision_threshold_ratio):
+                    reachable.append(idx)
+            return reachable
+
+        start_candidates = find_reachable_centers(start_world, max_try=20)
+        goal_candidates = find_reachable_centers(goal_world, max_try=20)
+
+        if len(start_candidates) == 0 or len(goal_candidates) == 0:
+            # fallback: if direct start->goal line is ok and meets spacing, return direct
+            if self.line_collision_free(start_world, goal_world, obstacle_voxel, threshold_ratio=collision_threshold_ratio):
+                length = float(np.linalg.norm(goal_world - start_world))
+                interf = self.line_collision_ratio(start_world, goal_world, obstacle_voxel)
+                score = - weight_length * (length / 1000.0) - weight_interf * interf
+                return [{
+                    'centers_idx': [],
+                    'centers_world': [],
+                    'segments': [(start_world, goal_world)],
+                    'length_mm': length,
+                    'interf_ratio': interf,
+                    'score': score
+                }]
+            return []
+
+        # 4) for each pair (s,g) run k-shortest on center graph
+        candidate_paths = []
+        # build a small filtered adjacency that contains only nodes reachable in practice
+        # we'll attempt for each s in start_candidates and g in goal_candidates
+        for s in start_candidates:
+            for g in goal_candidates:
+                # run K-shortest
+                # use yen_k_shortest_nodes on adj
+                k_paths = self.yen_wrapper(adj, s, g, K=top_k_paths)
+                for node_path in k_paths:
+                    # convert node_path -> centers world sequence
+                    centers_seq_world = [centers_world[n] for n in node_path]
+                    # full segments: start -> c0, c0->c1,..., last->goal
+                    segs = []
+                    segs.append((start_world, centers_seq_world[0]))
+                    for i in range(len(centers_seq_world) - 1):
+                        segs.append((centers_seq_world[i], centers_seq_world[i + 1]))
+                    segs.append((centers_seq_world[-1], goal_world))
+
+                    # evaluate path: length & overall interference ratio (weighted average of segments by sample count)
+                    total_len = 0.0
+                    total_samples = 0
+                    total_hits = 0
+                    for a, b in segs:
+                        L = float(np.linalg.norm(b - a))
+                        total_len += L
+                        # compute ratio with step ~ voxel_size*0.5
+                        step_mm = max(0.5 * self.voxel_size, 1.0)
+                        steps = max(1, int(np.ceil(L / step_mm)))
+                        pts = steps + 1
+                        # reuse line_collision_ratio but it returns ratio; compute hits = ratio*pts
+                        r = self.line_collision_ratio(a, b, obstacle_voxel, step_mm=step_mm)
+                        hits = int(round(r * pts))
+                        total_hits += hits
+                        total_samples += pts
+
+                    overall_ratio = float(total_hits) / float(max(1, total_samples))
+                    # score: lower length & lower ratio better -> maximize negative cost
+                    # normalize length by meters to keep comparable
+                    score = - (weight_length * (total_len / 1000.0) + weight_interf * overall_ratio)
+
+                    candidate_paths.append({
+                        'node_path': node_path,
+                        'centers_idx': [tuple(centers_idx[n]) for n in node_path],
+                        'centers_world': [centers_world[n] for n in node_path],
+                        'segments': segs,
+                        'length_mm': total_len,
+                        'interf_ratio': overall_ratio,
+                        'score': score
+                    })
+
+        # deduplicate by centers_idx chain
+        uniq = {}
+        for p in candidate_paths:
+            key = tuple(p['centers_idx'])
+            if key not in uniq or p['score'] > uniq[key]['score']:
+                uniq[key] = p
+        cand_list = sorted(uniq.values(), key=lambda x: x['score'], reverse=True)
+        return cand_list[:top_k_paths]
+
+    # wrapper for yen (uses internal centers_world variable closure)
+    def yen_wrapper(self, adj: Dict[int, List[Tuple[int, float]]], source: int, target: int, K: int = 3) -> List[List[int]]:
+        # we need centers_world in closure for comparator inside yen; pass as attribute
+        # safe copy of adj (shallow copy lists)
+        adj_copy = {u: list(v) for u, v in adj.items()}
+        # use local functions referencing centers_world via self if needed
+        return self.yen_k_shortest_nodes(adj_copy, source, target, K=K)
+
+    # -------------- visualization --------------
+    def visualize(self, candidate_routes: List[Dict[str, Any]], highlight_idx: int = 0, show_planning_points: bool = False):
+        if not _HAS_O3D:
+            print("Open3D not available for visualization.")
+            return
+        vis_geoms = []
+        # planning grid points (optional)
+        if show_planning_points:
+            pts = np.argwhere(self.planning_grid)
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector((self.planning_voxel_origin + (self.planning_min_index + pts) * self.voxel_size))
+            pcd.paint_uniform_color([0.7, 0.7, 0.7])
+            vis_geoms.append(pcd)
+
+        # draw centers of best candidate(s)
+        for i, route in enumerate(candidate_routes):
+            color = [0, 0.8, 0] if i == highlight_idx else [0.2, 0.2, 1.0]
+            for p in route['centers_world']:
+                s = o3d.geometry.TriangleMesh.create_sphere(radius=self.voxel_size * 0.8)
+                s.translate(p)
+                s.paint_uniform_color(color)
+                vis_geoms.append(s)
+            # draw segments
+            for a, b in route['segments']:
+                # create line set
+                line_pts = [a, b]
+                ls = o3d.geometry.LineSet(
+                    points=o3d.utility.Vector3dVector(np.array(line_pts)),
+                    lines=o3d.utility.Vector2iVector([[0, 1]])
+                )
+                ls.paint_uniform_color([1.0, 0.2, 0.2] if i == highlight_idx else [0.6, 0.6, 0.6])
+                vis_geoms.append(ls)
+        o3d.visualization.draw_geometries(vis_geoms)
+
+# ---------------- Example usage ----------------
+# 假设在你的类方法中（如 self.voxelization 存在）：
+# planner = CoarseRoutePlanner(self.voxelization, self.planning_voxel_grid, self.planning_voxel_origin, self.planning_min_index, self.voxel_size)
+# candidates = planner.generate_candidate_routes(start_orig=(sx,sy,sz), goal_orig=(gx,gy,gz), coarse_cell_mm=300, min_span_mm=250, max_span_mm=350, top_k_paths=5)
+# planner.visualize(candidates, highlight_idx=0, show_planning_points=False)
