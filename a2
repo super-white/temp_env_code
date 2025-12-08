@@ -1,0 +1,371 @@
+# coarse_route_planner.py
+import numpy as np
+import heapq
+from typing import List, Tuple, Dict, Optional
+try:
+    import open3d as o3d
+    _HAS_O3D = True
+except Exception:
+    _HAS_O3D = False
+
+class CoarseRoutePlanner:
+    """
+    Coarse lattice based planner independent module.
+
+    Inputs required:
+      - planning_grid: np.ndarray bool (True = traversable in planning-grid coords)
+      - planning_voxel_origin: np.ndarray (3,) world coord for planning-grid origin (mm)
+      - planning_min_index: np.ndarray (3,) planning-grid offset relative to global voxel index
+      - orig_voxel_array: np.ndarray bool (True = obstacle)  -- 原始 safe grid
+      - orig_min_bound: np.ndarray (3,) world mm (the min_bound used when building orig voxels)
+      - voxel_size: float (mm)
+    """
+    def __init__(self,
+                 planning_grid: np.ndarray,
+                 planning_voxel_origin: np.ndarray,
+                 planning_min_index: np.ndarray,
+                 orig_voxel_array: np.ndarray,
+                 orig_min_bound: np.ndarray,
+                 voxel_size: float):
+        self.planning_grid = planning_grid
+        self.planning_voxel_origin = np.asarray(planning_voxel_origin, dtype=float)
+        self.planning_min_index = np.asarray(planning_min_index, dtype=float)
+        self.orig_voxel_array = orig_voxel_array
+        self.orig_min_bound = np.asarray(orig_min_bound, dtype=float)
+        self.voxel_size = float(voxel_size)
+
+        # lattice outputs
+        self.centers_idx = None    # (N,3) ints: planning-grid indices
+        self.centers_world = None  # (N,3) floats: world mm
+        self.adj = None            # adjacency dict: node -> list[(nei, weight)]
+        self.id2idx = None         # node -> planning idx tuple
+
+    # ----------------------------
+    # coordinate transforms
+    # ----------------------------
+    def planning_idx_to_world(self, pidx) -> np.ndarray:
+        # pidx: planning-grid index (relative to planning_grid)
+        return self.planning_voxel_origin + (self.planning_min_index + np.asarray(pidx, dtype=float)) * self.voxel_size
+
+    def world_to_orig_voxel(self, world_pt) -> Tuple[int,int,int]:
+        # world_pt in mm -> original voxel index (int tuple)
+        rel = (np.asarray(world_pt, dtype=float) - self.orig_min_bound) / self.voxel_size
+        return tuple(np.floor(rel).astype(int))
+
+    # ----------------------------
+    # build centers (block partition)
+    # ----------------------------
+    def build_block_centers(self, block_size: int = 5):
+        pg = self.planning_grid
+        sx, sy, sz = pg.shape
+        blocks_x = int(np.ceil(sx / block_size))
+        blocks_y = int(np.ceil(sy / block_size))
+        blocks_z = int(np.ceil(sz / block_size))
+
+        centers_idx = []
+        centers_world = []
+        for bx in range(blocks_x):
+            x0 = bx * block_size
+            x1 = min(sx, x0 + block_size)
+            for by in range(blocks_y):
+                y0 = by * block_size
+                y1 = min(sy, y0 + block_size)
+                for bz in range(blocks_z):
+                    z0 = bz * block_size
+                    z1 = min(sz, z0 + block_size)
+                    block = pg[x0:x1, y0:y1, z0:z1]
+                    if np.any(block):
+                        cx = (x0 + x1 - 1) // 2
+                        cy = (y0 + y1 - 1) // 2
+                        cz = (z0 + z1 - 1) // 2
+                        centers_idx.append((cx, cy, cz))
+                        world = self.planning_idx_to_world((cx, cy, cz))
+                        centers_world.append(world)
+        if len(centers_idx) == 0:
+            self.centers_idx = np.zeros((0,3), dtype=int)
+            self.centers_world = np.zeros((0,3), dtype=float)
+        else:
+            self.centers_idx = np.array(centers_idx, dtype=int)
+            self.centers_world = np.array(centers_world, dtype=float)
+
+        return self.centers_idx, self.centers_world
+
+    # ----------------------------
+    # helper: check straight-line connectivity in planning-grid index coordinates
+    # ----------------------------
+    def index_line_clear(self, a_idx: Tuple[int,int,int], b_idx: Tuple[int,int,int]) -> bool:
+        a = np.array(a_idx, dtype=float)
+        b = np.array(b_idx, dtype=float)
+        diff = b - a
+        steps = int(np.ceil(np.max(np.abs(diff))))
+        steps = max(1, steps)
+        for t in np.linspace(0.0, 1.0, steps + 1):
+            p = a + t * diff
+            pi = np.round(p).astype(int)
+            if (pi < 0).any() or pi[0] >= self.planning_grid.shape[0] or pi[1] >= self.planning_grid.shape[1] or pi[2] >= self.planning_grid.shape[2]:
+                return False
+            if not bool(self.planning_grid[pi[0], pi[1], pi[2]]):
+                return False
+        return True
+
+    # ----------------------------
+    # build adjacency between centers
+    # ----------------------------
+    def build_center_graph(self, connectivity: int = 6):
+        assert self.centers_idx is not None
+        N = len(self.centers_idx)
+        id2idx = {i: tuple(self.centers_idx[i]) for i in range(N)}
+        idx_to_id = {tuple(self.centers_idx[i]): i for i in range(N)}
+
+        neigh = []
+        for dx in (-1,0,1):
+            for dy in (-1,0,1):
+                for dz in (-1,0,1):
+                    if dx==0 and dy==0 and dz==0: continue
+                    if connectivity==6 and (abs(dx)+abs(dy)+abs(dz))!=1: continue
+                    neigh.append((dx,dy,dz))
+
+        adj = {i: [] for i in range(N)}
+        for i in range(N):
+            xi, yi, zi = id2idx[i]
+            # try exact neighbor centers in block-grid offsets (fast)
+            for dx,dy,dz in neigh:
+                nb = (xi+dx, yi+dy, zi+dz)
+                j = idx_to_id.get(nb)
+                if j is None: 
+                    continue
+                if j == i: 
+                    continue
+                if self.index_line_clear(id2idx[i], id2idx[j]):
+                    w = float(np.linalg.norm(np.array(id2idx[i], dtype=float) - np.array(id2idx[j], dtype=float)))
+                    adj[i].append((j, w))
+                    adj[j].append((i, w))
+        self.adj = adj
+        self.id2idx = id2idx
+        return adj, id2idx
+
+    # ----------------------------
+    # dijkstra + yen k-shortest (simple)
+    # ----------------------------
+    def dijkstra_path(self, source: int, target: int) -> Optional[List[int]]:
+        adj = self.adj
+        pq = []
+        heapq.heappush(pq, (0.0, source))
+        dist = {source: 0.0}
+        prev = {}
+        visited = set()
+        while pq:
+            d,u = heapq.heappop(pq)
+            if u in visited: continue
+            visited.add(u)
+            if u == target:
+                path = [u]
+                while path[-1] != source:
+                    path.append(prev[path[-1]])
+                return path[::-1]
+            for v,w in adj.get(u, []):
+                nd = d + w
+                if v not in dist or nd < dist[v]:
+                    dist[v] = nd
+                    prev[v] = u
+                    heapq.heappush(pq, (nd, v))
+        return None
+
+    def yen_k_shortest(self, source: int, target: int, K: int = 3) -> List[List[int]]:
+        A = []
+        B = []
+        p0 = self.dijkstra_path(source, target)
+        if p0 is None:
+            return []
+        A.append(p0)
+        for k in range(1, K):
+            for i in range(len(A[-1]) - 1):
+                spur_node = A[-1][i]
+                root_path = A[-1][:i+1]
+                removed_edges = []
+                removed_nodes = set()
+                # temporarily remove edges that share same root
+                for p in A:
+                    if len(p) > i and p[:i+1] == root_path:
+                        u = p[i]; v = p[i+1]
+                        if v in [vv for vv,_ in self.adj[u]]:
+                            # remove v from u
+                            self.adj[u] = [(nv,nw) for (nv,nw) in self.adj[u] if nv != v]
+                            removed_edges.append((u,v))
+                spur = self.dijkstra_path(spur_node, target)
+                # restore removed
+                for (u,v) in removed_edges:
+                    # we can't recover original weights easily here, but simple approach:
+                    # recompute full adj via rebuild (cheap if N small). To be safe, rebuild graph
+                    self.build_center_graph()
+                if spur is not None:
+                    total = root_path[:-1] + spur
+                    if total not in B:
+                        B.append(total)
+            if not B:
+                break
+            # select shortest by node-count / length
+            B.sort(key=lambda p: sum(np.linalg.norm(np.array(self.centers_world[i]) - np.array(self.centers_world[j])) for i,j in zip(p[:-1], p[1:])))
+            A.append(B.pop(0))
+        return A
+
+    # ----------------------------
+    # find nearest center node for a planning idx or world/orig input
+    # ----------------------------
+    def find_nearest_center_node_from_planning_idx(self, planning_idx) -> Optional[int]:
+        if self.centers_idx is None or len(self.centers_idx)==0:
+            return None
+        from scipy.spatial import cKDTree
+        kdt = cKDTree(self.centers_idx.astype(float))
+        _, nid = kdt.query(np.asarray(planning_idx, dtype=float), k=1)
+        return int(nid)
+
+    def find_nearest_center_node_from_world(self, world_pt) -> Optional[int]:
+        if self.centers_world is None or len(self.centers_world)==0:
+            return None
+        from scipy.spatial import cKDTree
+        kdt = cKDTree(self.centers_world.astype(float))
+        _, nid = kdt.query(np.asarray(world_pt, dtype=float), k=1)
+        return int(nid)
+
+    # ----------------------------
+    # convert node-path -> world polyline
+    # ----------------------------
+    def nodes_to_world_polyline(self, node_path: List[int]) -> List[np.ndarray]:
+        return [self.centers_world[n] for n in node_path]
+
+    # ----------------------------
+    # high-res collision check between two world pts using orig_voxel_array
+    # ----------------------------
+    def line_collision_free_highres(self, world_a, world_b, step_factor: float = 0.5) -> bool:
+        a_w = np.asarray(world_a, dtype=float)
+        b_w = np.asarray(world_b, dtype=float)
+        vec = b_w - a_w
+        L = np.linalg.norm(vec)
+        if L <= 0:
+            ai = np.asarray(self.world_to_orig_voxel(a_w), dtype=int)
+            if (ai < 0).any() or ai[0] >= self.orig_voxel_array.shape[0] or ai[1] >= self.orig_voxel_array.shape[1] or ai[2] >= self.orig_voxel_array.shape[2]:
+                return False
+            return not bool(self.orig_voxel_array[ai[0], ai[1], ai[2]])
+        step = max(1, int(np.ceil(L / (self.voxel_size * step_factor))))
+        for t in np.linspace(0.0, 1.0, step + 1):
+            p = a_w + t * vec
+            pi = np.asarray(self.world_to_orig_voxel(p), dtype=int)
+            if (pi < 0).any() or pi[0] >= self.orig_voxel_array.shape[0] or pi[1] >= self.orig_voxel_array.shape[1] or pi[2] >= self.orig_voxel_array.shape[2]:
+                return False
+            if self.orig_voxel_array[pi[0], pi[1], pi[2]]:
+                return False
+        return True
+
+    # ----------------------------
+    # validate & score a candidate node-path
+    # ----------------------------
+    def validate_and_score_node_path(self, node_path: List[int], step_factor: float = 0.5):
+        # Convert nodes -> world polyline
+        ws = self.nodes_to_world_polyline(node_path)
+        # 1) verify each adjacency segment is clear in planning-grid (already used when building graph,
+        #    but re-check here)
+        for i in range(len(node_path)-1):
+            a_idx = self.id2idx[node_path[i]]
+            b_idx = self.id2idx[node_path[i+1]]
+            if not self.index_line_clear(a_idx, b_idx):
+                return None  # invalid
+
+        # 2) high-res collision check for each segment
+        total_len = 0.0
+        collision_points = 0
+        sample_count = 0
+        for i in range(len(ws)-1):
+            a_w = ws[i]; b_w = ws[i+1]
+            seg_len = np.linalg.norm(b_w - a_w)
+            total_len += seg_len
+            # sample and count collisions
+            a_w = np.asarray(a_w); b_w = np.asarray(b_w)
+            L = np.linalg.norm(b_w - a_w)
+            if L <= 0: continue
+            step = max(1, int(np.ceil(L / (self.voxel_size * step_factor))))
+            for t in np.linspace(0.0, 1.0, step + 1):
+                sample_count += 1
+                p = a_w + t * (b_w - a_w)
+                pi = np.asarray(self.world_to_orig_voxel(p), dtype=int)
+                if (pi < 0).any() or pi[0] >= self.orig_voxel_array.shape[0] or pi[1] >= self.orig_voxel_array.shape[1] or pi[2] >= self.orig_voxel_array.shape[2]:
+                    collision_points += 1
+                elif self.orig_voxel_array[pi[0], pi[1], pi[2]]:
+                    collision_points += 1
+        if sample_count == 0:
+            collision_ratio = 1.0
+        else:
+            collision_ratio = collision_points / sample_count
+
+        score = {
+            "length_mm": float(total_len),
+            "collision_ratio": float(collision_ratio),
+            "valid": collision_ratio < 0.01  # adjustable threshold
+        }
+        return {"node_path": node_path, "world_polyline": ws, "score": score}
+
+    # ----------------------------
+    # top-level: produce K candidate polylines between start_orig and goal_orig (orig voxel indices)
+    # ----------------------------
+    def plan_k_coarse_paths(self, start_orig_vox: Tuple[int,int,int], goal_orig_vox: Tuple[int,int,int], K: int = 3, block_size: int = 5, connectivity: int = 6):
+        # ensure centers + graph built
+        if self.centers_idx is None:
+            self.build_block_centers(block_size=block_size)
+        if self.adj is None:
+            self.build_center_graph(connectivity=connectivity)
+
+        # convert start_orig_vox -> world -> planning idx estimate
+        start_world = self.orig_min_bound + np.array(start_orig_vox, dtype=float) * self.voxel_size
+        goal_world = self.orig_min_bound + np.array(goal_orig_vox, dtype=float) * self.voxel_size
+        # planning idx est:
+        start_planning_idx_est = (start_world - self.planning_voxel_origin) / self.voxel_size - self.planning_min_index
+        goal_planning_idx_est = (goal_world - self.planning_voxel_origin) / self.voxel_size - self.planning_min_index
+
+        s_node = self.find_nearest_center_node_from_planning_idx(start_planning_idx_est)
+        g_node = self.find_nearest_center_node_from_planning_idx(goal_planning_idx_est)
+        if s_node is None or g_node is None:
+            return []
+
+        raw_node_paths = self.yen_k_shortest(s_node, g_node, K)
+        results = []
+        for node_path in raw_node_paths:
+            meta = self.validate_and_score_node_path(node_path)
+            if meta is not None:
+                results.append(meta)
+        # sort by score (valid first, then length, then collision ratio)
+        results.sort(key=lambda r: (not r['score']['valid'], r['score']['collision_ratio'], r['score']['length_mm']))
+        return results
+
+    # ----------------------------
+    # visualization helper
+    # ----------------------------
+    def visualize(self, highlight_nodes: List[int] = None, show_paths: List[List[np.ndarray]] = None):
+        if not _HAS_O3D:
+            print("open3d not available")
+            return
+        vis = []
+        if self.centers_idx is not None and len(self.centers_idx)>0:
+            pts = np.asarray(self.centers_world)
+            pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts))
+            pcd.paint_uniform_color([0.1, 0.6, 0.1])
+            vis.append(pcd)
+        # highlight nodes
+        if highlight_nodes:
+            for nid in highlight_nodes:
+                if nid<0 or nid>=len(self.centers_world): continue
+                s = o3d.geometry.TriangleMesh.create_sphere(radius=self.voxel_size*0.5)
+                s.translate(self.centers_world[nid])
+                s.paint_uniform_color([0,0,1])
+                vis.append(s)
+        # show paths
+        if show_paths:
+            for path in show_paths:
+                # path is list of world points
+                lines = []
+                points = []
+                for p in path:
+                    points.append(p)
+                if len(points) >= 2:
+                    pts = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(np.array(points)))
+                    vis.append(pts)
+        o3d.visualization.draw_geometries(vis)
