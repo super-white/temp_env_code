@@ -1,0 +1,139 @@
+# application/routing_pipeline.py
+import time
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, Optional
+
+logger = logging.getLogger(__name__)
+
+
+class RoutingPipeline:
+    """
+    调度器：与 GeometryPipeline 的 request DTO 对接。
+    geometry_pipeline.run(request) -> GeometryContext (ctx)
+    ctx 中至少应包含 planning_voxel/planning_voxel_grid、safe_map、planning_voxel_origin,
+    planning_min_index, voxel_size 等字段（参见上方约定）。
+    """
+
+    def __init__(
+        self,
+        ports: Dict[str, Any],
+        geometry_pipeline: Any,
+        planner_selector: Any,
+        scoring_service: Any,
+        postprocess_service: Any,
+        *,
+        max_workers: int = 4,
+        per_route_timeout: Optional[float] = None,
+    ):
+        self.ports = ports
+        self.geometry_pipeline = geometry_pipeline
+        self.planner_selector = planner_selector
+        self.scoring_service = scoring_service
+        self.postprocess_service = postprocess_service
+
+        self.max_workers = max_workers
+        self.per_route_timeout = per_route_timeout
+
+    def _load_model_via_port(self, source_key: str, request: Dict[str, Any]):
+        """
+        这里不强行 load raw，因为你的 GeometryPipeline 的步骤可能自己去读取文件。
+        但如果需要提前用 port 取得某些资源，可在这里实现。
+        默认直接返回 None（让 geometry_pipeline 处理文件）。
+        """
+        port = self.ports.get(source_key)
+        if port is None:
+            return None
+        # optional: let port prefetch or validate
+        if hasattr(port, "prefetch"):
+            try:
+                return port.prefetch(request)
+            except Exception:
+                logger.debug("Port prefetch failed; letting geometry pipeline read files")
+        return None
+
+    def _plan_single_route(self, route_req: Dict[str, Any], ctx: Any) -> Dict[str, Any]:
+        t0 = time.time()
+        route_id = route_req.get("route_name") or route_req.get("id") or str(time.time())
+        try:
+            # 选择 planner（领域层） - planner 需要按 ctx 中的 planning_voxel / safe_map 工作
+            planner = self.planner_selector.select(route_req, ctx)
+            path = planner.plan(route_req, ctx)
+
+            if not path:
+                return {"route_id": route_id, "status": "failed", "path": [], "score": 0.0,
+                        "detail": {"reason": "empty_path"}, "elapsed": time.time() - t0}
+
+            score, detail = self.scoring_service.evaluate(path, ctx)
+
+            final_path = self.postprocess_service.smooth(path, ctx)
+
+            return {"route_id": route_id, "status": "success", "path": final_path,
+                    "score": score, "detail": detail, "elapsed": time.time() - t0}
+        except Exception as e:
+            logger.exception("Route planning failed for %s", route_req)
+            return {"route_id": route_id, "status": "failed", "path": [], "score": 0.0,
+                    "detail": {"error": str(e)}, "elapsed": time.time() - t0, "error": str(e)}
+
+    def run(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        request 必须是 geometry_pipeline 能消费的 DTO（例如 demo_request）。
+        例如：
+            {
+              "mesh_path": "...",
+              "pc_path": None,
+              "voxel_size": 6.0,
+              "start": ...,
+              "goal": ...,
+              "routes": [ {...}, {...} ],
+              "source": "UG"  # optional，用于 ports 的选择
+            }
+        """
+        overall_t0 = time.time()
+        # 可选：让 port 做预加载（多数情况下 geometry_pipeline 自己读文件）
+        source_key = request.get("source", None)
+        try:
+            _ = self._load_model_via_port(source_key, request)
+        except Exception:
+            logger.debug("port prefetch failed/ignored")
+
+        # 1) Geometry preprocessing：直接把 request 传入 geometry_pipeline（与 demo 用法一致）
+        t0 = time.time()
+        ctx = self.geometry_pipeline.run(request)  # <-- 与你的 demo 调度一致
+        t_geo = time.time() - t0
+        logger.info("Geometry pipeline finished in %.3fs", t_geo)
+
+        # 验证 ctx 是否包含必要字段（轻量检查）
+        if not hasattr(ctx, "planning_voxel") and not hasattr(ctx, "planning_voxel_grid"):
+            logger.warning("ctx missing planning_voxel; planners may fallback to safe-only")
+
+        routes = request.get("routes") or request.get("multi_routes") or []
+        results = []
+
+        if not routes:
+            logger.warning("No routes specified")
+            return {"meta": {"t_geo": t_geo, "elapsed_total": time.time() - overall_t0}, "routes": []}
+
+        # 2) 并行或顺序执行每条 route（并行默认）
+        with ThreadPoolExecutor(max_workers=self.max_workers) as ex:
+            future_map = {}
+            for r in routes:
+                future = ex.submit(self._plan_single_route, r, ctx)
+                future_map[future] = r
+
+            for fut in as_completed(future_map.keys()):
+                try:
+                    if self.per_route_timeout:
+                        res = fut.result(timeout=self.per_route_timeout)
+                    else:
+                        res = fut.result()
+                except Exception as e:
+                    route = future_map.get(fut)
+                    route_id = route.get("route_name") if route else "unknown"
+                    logger.exception("route worker failed: %s", route_id)
+                    res = {"route_id": route_id, "status": "failed", "path": [], "score": 0.0,
+                           "detail": {"error": str(e)}, "elapsed": None}
+                results.append(res)
+
+        elapsed_total = time.time() - overall_t0
+        return {"meta": {"t_geo": t_geo, "elapsed_total": elapsed_total, "n_routes": len(routes)}, "routes": results}
