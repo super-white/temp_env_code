@@ -1,0 +1,90 @@
+import numpy as np
+import open3d as o3d
+
+
+def visualize_routes_with_supports(
+    safe: np.ndarray,
+    support_points: np.ndarray,
+    start: np.ndarray,
+    goal: np.ndarray,
+    route_candidates: list,     # 由 plan_multi_support_sequences 返回的结果
+    voxel_size: float = 1.0,    # 每个 voxel 代表的真实尺寸（mm 或 m）
+    max_routes: int = 5         # 最多展示多少条线路
+):
+    """
+    safe               : 3D bool grid，True = 障碍体素
+    support_points     : (M,3) 支架点，体素坐标
+    start, goal        : (3,) 点坐标（体素坐标）
+    route_candidates   : plan_multi_support_sequences() 的返回结果
+    voxel_size         : 若为体素索引空间，则设定为1；若safe来自真实 mm 体素，则填写 voxel_size_mm
+    max_routes         : 最多展示 N 条候选路径
+    """
+
+    geoms = []
+
+    # -------------------------
+    # 1. 障碍体素 (灰色)
+    # -------------------------
+    occ_idx = np.argwhere(safe)
+    if len(occ_idx) > 0:
+        vox = o3d.geometry.PointCloud()
+        vox.points = o3d.utility.Vector3dVector(occ_idx * voxel_size)
+        vox.paint_uniform_color([0.6, 0.6, 0.6])
+        geoms.append(vox)
+
+    # -------------------------
+    # 2. 支架点 (蓝色)
+    # -------------------------
+    if support_points is not None and len(support_points) > 0:
+        sp = o3d.geometry.PointCloud()
+        sp.points = o3d.utility.Vector3dVector(support_points * voxel_size)
+        sp.paint_uniform_color([0.2, 0.4, 1.0])
+        geoms.append(sp)
+
+    # -------------------------
+    # 3. 起点 / 终点
+    # -------------------------
+    def make_sphere(center, color, radius=3.5):
+        s = o3d.geometry.TriangleMesh.create_sphere(radius=radius)
+        s.translate(center * voxel_size)
+        s.paint_uniform_color(color)
+        return s
+
+    geoms.append(make_sphere(np.array(start), [0, 1, 0]))  # green start
+    geoms.append(make_sphere(np.array(goal), [1, 0, 0]))   # red goal
+
+    # -------------------------
+    # 4. 路径线条 (自动颜色)
+    # -------------------------
+    colors = [
+        [1, 0, 0], [0, 1, 0], [0, 0, 1],
+        [1, 0.6, 0], [0, 1, 1], [1, 0, 1],
+        [0.5, 0.2, 0.9]
+    ]
+
+    for i, cand in enumerate(route_candidates[:max_routes]):
+        pts = cand["points"] * voxel_size
+        pts = np.asarray(pts, dtype=float)
+
+        # 每段连成 LineSet
+        lines = [[j, j + 1] for j in range(len(pts) - 1)]
+
+        ls = o3d.geometry.LineSet()
+        ls.points = o3d.utility.Vector3dVector(pts)
+        ls.lines = o3d.utility.Vector2iVector(lines)
+
+        col = colors[i % len(colors)]
+        ls.colors = o3d.utility.Vector3dVector([col for _ in lines])
+
+        geoms.append(ls)
+
+    # -------------------------
+    # 显示
+    # -------------------------
+    o3d.visualization.draw_geometries(
+        geoms,
+        window_name="Routing Result",
+        width=1500,
+        height=900,
+        point_show_normal=False,
+    )
