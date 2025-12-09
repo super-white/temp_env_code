@@ -1,0 +1,22 @@
+# safe: np.ndarray shape (X,Y,Z) boolean (True=obstacle)
+# start, goal: np.array([x,y,z]) (体素索引空间)
+# support_points: np.array shape (M,3) 候选支架点（体素索引空间）
+
+cands = plan_multi_support_sequences(
+    safe=safe,
+    start=start_vox,
+    goal=goal_vox,
+    support_points=support_points,
+    d_min=250/voxel_size,   # 如果 support_points 是“体素索引”，这里把 mm->vox
+    d_max=350/voxel_size,
+    sample_step=max(1.0, 50/voxel_size),  # 采样间隔（vox 单位）
+    target_len=300/voxel_size,
+    max_hops=4,
+    beam_width=200,
+    top_k=6
+)
+
+for r in cands:
+    print("nodes:", r['nodes'], "avg_score:", r['avg_score'], "avg_col:", r['avg_collision'])
+    for seg in r['seg_details']:
+        print("  seg", seg)
