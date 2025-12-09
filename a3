@@ -1,0 +1,420 @@
+"""
+geometry_pipeline.py
+
+一体化 GeometryPipeline 单文件实现（可拆分为 domain/geometry/...）。
+包含：
+ - GeometryContext
+ - GeometryStep (基类)
+ - 若干实现 Step (STL/PCD加载、体素化、膨胀、保护区、连通域、distance-field)
+ - GeometrySourcePort 抽象 + Adapter stub
+ - GeometryPipeline 执行器
+ - 使用示例（示范如何构造 pipeline 并运行）
+"""
+
+from __future__ import annotations
+import numpy as np
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Tuple, Optional, Sequence
+import logging
+
+# 可选依赖（实际运行需要安装 open3d / scipy）
+try:
+    import open3d as o3d
+except Exception:
+    o3d = None
+
+try:
+    from scipy.ndimage import binary_dilation, distance_transform_edt, label
+except Exception:
+    binary_dilation = None
+    distance_transform_edt = None
+    label = None
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+
+# ----------------------------
+# Geometry Context (共享数据)
+# ----------------------------
+@dataclass
+class GeometryContext:
+    """
+    所有 Steps 读写同一个 context。
+    方便后续扩展字段（不破坏签名）。
+    """
+    raw_mesh: Any = None                # open3d TriangleMesh 或 None
+    point_cloud: Any = None             # open3d PointCloud 或 numpy (Nx3)
+    voxel_occupancy: Optional[np.ndarray] = None   # bool array True = obstacle
+    voxel_height: Optional[np.ndarray] = None     # optional proportion field
+    planning_voxel: Optional[np.ndarray] = None   # bool array True = planning allowed
+    min_bound: Optional[np.ndarray] = None        # world mm lower bound
+    max_bound: Optional[np.ndarray] = None
+    voxel_size: float = 4.0
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+
+# ----------------------------
+# Step 基类
+# ----------------------------
+class GeometryStep:
+    order: int = 100
+
+    def run(self, ctx: GeometryContext, request: Any) -> None:
+        """执行一步，修改 ctx。request 为用户输入或 DTO。"""
+        raise NotImplementedError()
+
+
+# ----------------------------
+# Source Port + Adapters (抽象 + stub)
+# ----------------------------
+class GeometrySourcePort:
+    """抽象：提供 mesh / point cloud 数据的来源（UG / 点云工具 / 文件等）。"""
+
+    def load_mesh(self, path: str):
+        """load and return a mesh-like object (open3d.geometry.TriangleMesh or similar)."""
+        raise NotImplementedError()
+
+    def load_point_cloud(self, path: str):
+        """load and return point cloud (open3d.geometry.PointCloud or Nx3 numpy)."""
+        raise NotImplementedError()
+
+
+class UGSourceAdapter(GeometrySourcePort):
+    """示例（UG/远程服务）——这里仅为 stub，实际实现需调用 HTTP/插件等。"""
+
+    def __init__(self, endpoint: str):
+        self.endpoint = endpoint
+
+    def load_mesh(self, path: str):
+        # TODO: 实际调用 UG 服务或从文件读取
+        logger.info(f"[UGAdapter] load_mesh from {path} (stub)")
+        if o3d:
+            return o3d.io.read_triangle_mesh(path)
+        raise RuntimeError("open3d not available")
+
+    def load_point_cloud(self, path: str):
+        logger.info(f"[UGAdapter] load_point_cloud from {path} (stub)")
+        if o3d:
+            pcd = o3d.io.read_point_cloud(path)
+            return pcd
+        raise RuntimeError("open3d not available")
+
+
+class PointCloudAdapter(GeometrySourcePort):
+    """示例（本地点云工具），预留实现位置"""
+
+    def __init__(self, tool_dir: str):
+        self.tool_dir = tool_dir
+
+    def load_mesh(self, path: str):
+        # 如果没有 mesh，尝试把 ply 转成 mesh 或从点云构建表面（可选）
+        logger.info(f"[PCDAdapter] load_mesh from {path} (fallback to pointcloud->mesh)")
+        if o3d:
+            pcd = o3d.io.read_point_cloud(path)
+            # 这里只是示例：用简单方法生成点->体素或三角化
+            mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(pcd, alpha=1.0)
+            return mesh
+        raise RuntimeError("open3d not available")
+
+    def load_point_cloud(self, path: str):
+        logger.info(f"[PCDAdapter] load_point_cloud from {path} (stub)")
+        if o3d:
+            return o3d.io.read_point_cloud(path)
+        raise RuntimeError("open3d not available")
+
+
+# ----------------------------
+# Utility 函数（体素化、点云->体素）
+# ----------------------------
+def mesh_sample_points(mesh, n_points: int = 200000) -> np.ndarray:
+    if o3d and isinstance(mesh, o3d.geometry.TriangleMesh):
+        pcd = mesh.sample_points_uniformly(number_of_points=n_points)
+        return np.asarray(pcd.points)
+    raise RuntimeError("open3d not available or invalid mesh")
+
+
+def pointcloud_to_numpy(pcd) -> np.ndarray:
+    if o3d and isinstance(pcd, o3d.geometry.PointCloud):
+        return np.asarray(pcd.points)
+    if isinstance(pcd, np.ndarray):
+        return pcd
+    raise RuntimeError("unsupported point cloud type")
+
+
+def build_voxel_occupancy_from_points(points: np.ndarray, voxel_size: float, min_bound: np.ndarray, grid_shape: Tuple[int, int, int]):
+    """
+    根据点云产生 bool occupancy (True 表示障碍/有点).
+    返回 occupancy (bool数组) 和 counts (int数组)
+    """
+    indices = ((points - min_bound) / voxel_size).astype(int)
+    # clamp
+    indices = indices[np.all(indices >= 0, axis=1)]
+    idxs = np.minimum(indices, np.array(grid_shape) - 1)
+    occ = np.zeros(grid_shape, dtype=bool)
+    # optional counts
+    from collections import defaultdict
+    cnt = defaultdict(int)
+    for t in idxs:
+        cnt[tuple(t)] += 1
+    for k in cnt.keys():
+        occ[k] = True
+    return occ, cnt
+
+
+def compute_grid_shape(min_bound: np.ndarray, max_bound: np.ndarray, voxel_size: float):
+    shape = np.ceil((max_bound - min_bound) / voxel_size).astype(int) + 1
+    # ensure shape >= 1 in every dim
+    shape = np.maximum(shape, 1)
+    return tuple(shape.tolist())
+
+
+# ----------------------------
+# Concrete Steps
+# ----------------------------
+
+class STLParseStep(GeometryStep):
+    """从文件/adapter 读取 mesh 并在 ctx.raw_mesh 中保存"""
+    order = 10
+
+    def __init__(self, source: GeometrySourcePort, mesh_path_field: str = "mesh_path"):
+        self.source = source
+        self.mesh_path_field = mesh_path_field
+
+    def run(self, ctx: GeometryContext, request: Any) -> None:
+        mesh_path = getattr(request, self.mesh_path_field, None) or request.get(self.mesh_path_field)
+        if mesh_path is None:
+            logger.info("STLParseStep: no mesh_path in request")
+            return
+        mesh = self.source.load_mesh(mesh_path)
+        ctx.raw_mesh = mesh
+        logger.info("STLParseStep: mesh loaded")
+
+
+class PointCloudLoadStep(GeometryStep):
+    """可选：直接从 ply/pcd 读取点云"""
+    order = 12
+
+    def __init__(self, source: GeometrySourcePort, pc_path_field: str = "pc_path"):
+        self.source = source
+        self.pc_path_field = pc_path_field
+
+    def run(self, ctx: GeometryContext, request: Any) -> None:
+        pc_path = getattr(request, self.pc_path_field, None) or request.get(self.pc_path_field)
+        if pc_path is None:
+            return
+        pcd = self.source.load_point_cloud(pc_path)
+        ctx.point_cloud = pcd
+        logger.info("PointCloudLoadStep: point cloud loaded")
+
+
+class VoxelizeStep(GeometryStep):
+    """
+    从 ctx.raw_mesh 或 ctx.point_cloud 生成 voxel_occupancy 和 height（占据比例）
+    """
+    order = 20
+
+    def __init__(self, voxel_size_field: str = "voxel_size", sample_points: int = 200000):
+        self.voxel_size_field = voxel_size_field
+        self.sample_points = sample_points
+
+    def run(self, ctx: GeometryContext, request: Any) -> None:
+        voxel_size = getattr(request, self.voxel_size_field, None) or request.get(self.voxel_size_field) or ctx.voxel_size
+        ctx.voxel_size = float(voxel_size)
+
+        # get points: priority point_cloud then mesh sampling
+        pts = None
+        if ctx.point_cloud is not None:
+            try:
+                pts = pointcloud_to_numpy(ctx.point_cloud)
+            except Exception:
+                pts = None
+
+        if pts is None and ctx.raw_mesh is not None:
+            pts = mesh_sample_points(ctx.raw_mesh, n_points=self.sample_points)
+
+        if pts is None or len(pts) == 0:
+            raise RuntimeError("VoxelizeStep: no points available for voxelization")
+
+        min_bound = pts.min(axis=0)
+        max_bound = pts.max(axis=0)
+        ctx.min_bound = min_bound
+        ctx.max_bound = max_bound
+
+        grid_shape = compute_grid_shape(min_bound, max_bound, voxel_size)
+        ctx.extra['grid_shape'] = grid_shape
+
+        occ, counts = build_voxel_occupancy_from_points(pts, voxel_size, min_bound, grid_shape)
+        ctx.voxel_occupancy = occ
+        # produce height field (normalized counts)
+        maxcnt = max(counts.values()) if counts else 1
+        heights = np.zeros(grid_shape, dtype=np.float32)
+        for k, v in counts.items():
+            heights[k] = min(1.0, float(v) / maxcnt)
+        ctx.voxel_height = heights
+        logger.info(f"VoxelizeStep: voxel grid shape={grid_shape}, occupied={occ.sum()}")
+
+
+class ObstacleExpandStep(GeometryStep):
+    """
+    对某些零件做 '膨胀'，这里实现通用的 binary_dilation 膨胀（半径 mm -> vox）
+    可以设置 inner/outer 做壳膨胀（和你之前的球壳做法兼容）
+    """
+    order = 30
+
+    def __init__(self, dilate_mm: float = 30.0, inner_mm: Optional[float] = None):
+        self.dilate_mm = dilate_mm
+        self.inner_mm = inner_mm
+
+    def run(self, ctx: GeometryContext, request: Any) -> None:
+        if ctx.voxel_occupancy is None:
+            logger.info("ObstacleExpandStep: no occupancy to dilate")
+            return
+        if binary_dilation is None:
+            raise RuntimeError("scipy.ndimage.binary_dilation is required")
+
+        voxel_size = ctx.voxel_size
+        dilate_vox = int(np.ceil(self.dilate_mm / voxel_size))
+        # simple cube struct
+        struct = np.ones((2 * dilate_vox + 1,)*3, dtype=bool)
+        occ = ctx.voxel_occupancy
+        occ_dil = binary_dilation(occ, structure=struct)
+        # if inner_mm specified, remove region close to original obstacles (implement sphere shell)
+        if self.inner_mm is not None:
+            inner_vox = int(np.floor(self.inner_mm / voxel_size))
+            struct_inner = np.ones((2 * inner_vox + 1,)*3, dtype=bool)
+            occ_inner = binary_dilation(occ, structure=struct_inner)
+            shell = occ_dil & (~occ_inner)
+            planning = shell
+        else:
+            planning = occ_dil
+        # planning True = allowed? we follow your convention: True = planning allowed
+        ctx.planning_voxel = planning
+        logger.info(f"ObstacleExpandStep: planning voxels {ctx.planning_voxel.sum()}")
+
+
+class ProtectZoneStep(GeometryStep):
+    """在起点/终点周围刷禁行/保护区（以 voxel 为单位）"""
+    order = 35
+
+    def __init__(self, radius_mm: float = 20.0, start_field: str = "start", goal_field: str = "goal"):
+        self.radius_mm = radius_mm
+        self.start_field = start_field
+        self.goal_field = goal_field
+
+    def _world_to_vox(self, world_pt, ctx: GeometryContext):
+        # convert world point -> voxel index in original occupancy space
+        idx = np.round((np.array(world_pt) - ctx.min_bound) / ctx.voxel_size).astype(int)
+        return tuple(idx.tolist())
+
+    def run(self, ctx: GeometryContext, request: Any) -> None:
+        if ctx.planning_voxel is None:
+            logger.info("ProtectZoneStep: no planning grid")
+            return
+        start = request.get(self.start_field)
+        goal = request.get(self.goal_field)
+        radius_vox = int(np.ceil(self.radius_mm / ctx.voxel_size))
+        grid = ctx.planning_voxel.copy()
+        shape = grid.shape
+        def apply_center(center):
+            if center is None:
+                return
+            try:
+                vox = self._world_to_vox(center, ctx)
+            except Exception:
+                return
+            x0 = max(0, vox[0]-radius_vox); x1 = min(shape[0], vox[0]+radius_vox+1)
+            y0 = max(0, vox[1]-radius_vox); y1 = min(shape[1], vox[1]+radius_vox+1)
+            z0 = max(0, vox[2]-radius_vox); z1 = min(shape[2], vox[2]+radius_vox+1)
+            grid[x0:x1, y0:y1, z0:z1] = False
+        apply_center(start)
+        apply_center(goal)
+        ctx.planning_voxel = grid
+        logger.info("ProtectZoneStep: applied start/goal protect zones")
+
+
+class ConnectivityStep(GeometryStep):
+    """连通组件提取并把组件大小/数量写入 ctx.extra"""
+    order = 40
+
+    def __init__(self, min_size: int = 10):
+        self.min_size = min_size
+
+    def run(self, ctx: GeometryContext, request: Any) -> None:
+        if ctx.planning_voxel is None:
+            return
+        if label is None:
+            logger.warning("scipy.ndimage.label not available; skipping connectivity")
+            return
+        labeled, n = label(ctx.planning_voxel)
+        comps = {}
+        for cid in range(1, n+1):
+            mask = (labeled == cid)
+            size = mask.sum()
+            if size >= self.min_size:
+                comps[cid] = int(size)
+        ctx.extra['components'] = comps
+        logger.info(f"ConnectivityStep: found {len(comps)} components (>= {self.min_size})")
+
+
+class VoronoiPlaceholderStep(GeometryStep):
+    """占位：如果要插 Voronoi/骨架分析 放这里"""
+    order = 50
+
+    def run(self, ctx: GeometryContext, request: Any) -> None:
+        # placeholder - real implementation can compute distance field -> skeleton -> graph
+        logger.info("VoronoiPlaceholderStep: (no-op placeholder)")
+
+
+# ----------------------------
+# GeometryPipeline 实现
+# ----------------------------
+class GeometryPipeline:
+    def __init__(self, steps: Sequence[GeometryStep]):
+        # 按 order 排序
+        self.steps = sorted(list(steps), key=lambda s: getattr(s, "order", 100))
+
+    def run(self, request: Dict[str, Any]) -> GeometryContext:
+        ctx = GeometryContext()
+        logger.info("GeometryPipeline: start")
+        for step in self.steps:
+            logger.debug(f"GeometryPipeline: running step {step.__class__.__name__}")
+            step.run(ctx, request)
+        logger.info("GeometryPipeline: finished")
+        return ctx
+
+
+# ----------------------------
+# 示例：如何组装 pipeline 并运行
+# ----------------------------
+if __name__ == "__main__":
+    # 简易示范，替换成你的 request DTO
+    demo_request = {
+        # 如果有 stl 路径或 ply 路径就填
+        "mesh_path": "path/to/your/full_model.stl",   # 替换为真实文件
+        "pc_path": None,
+        "voxel_size": 6.0,
+        "start": None,
+        "goal": None
+    }
+
+    # 选一个 Source Adapter（真实工程中由 DI 注入）
+    src = UGSourceAdapter(endpoint="http://127.0.0.1:9000") if o3d else PointCloudAdapter(tool_dir="/opt/pcd_tools")
+
+    steps = [
+        STLParseStep(src, mesh_path_field="mesh_path"),
+        PointCloudLoadStep(src, pc_path_field="pc_path"),
+        VoxelizeStep(voxel_size_field="voxel_size", sample_points=200000),
+        ObstacleExpandStep(dilate_mm=30.0, inner_mm=10.0),
+        ProtectZoneStep(radius_mm=20.0),
+        ConnectivityStep(min_size=50),
+        VoronoiPlaceholderStep()
+    ]
+
+    pipeline = GeometryPipeline(steps)
+    try:
+        ctx = pipeline.run(demo_request)
+        logger.info(f"Result: planning voxel count = {None if ctx.planning_voxel is None else ctx.planning_voxel.sum()}")
+        logger.info(f"Extra: {ctx.extra.keys()}")
+    except Exception as e:
+        logger.exception("demo pipeline failed: %s", e)
