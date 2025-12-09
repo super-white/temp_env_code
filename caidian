@@ -1,0 +1,192 @@
+import numpy as np
+import heapq
+from typing import List, Tuple, Dict, Any
+
+# ---------- helpers ----------
+def euclid(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.linalg.norm(a - b))
+
+def interpolate_line(a: np.ndarray, b: np.ndarray, step: float = 10.0) -> np.ndarray:
+    """
+    在 a->b 上均匀采点，step 为采样间隔（与坐标系单位一致）
+    返回 pts: (M,3)
+    """
+    a = np.array(a, dtype=float)
+    b = np.array(b, dtype=float)
+    L = euclid(a, b)
+    if L <= 1e-9:
+        return a.reshape(1, 3)
+    n = max(2, int(np.ceil(L / step)))
+    t = np.linspace(0.0, 1.0, n)
+    return a[None, :] + np.outer(t, (b - a))
+
+def static_collision_rate(safe: np.ndarray, pts: np.ndarray) -> float:
+    """
+    safe: 3D bool grid, True means occupied
+    pts: (N,3) coordinates in *voxel index space*
+    返回: 命中比例（0..1）
+    """
+    if pts.size == 0:
+        return 0.0
+    idx = np.round(pts).astype(int)
+    # clamp indices
+    idx[:, 0] = np.clip(idx[:, 0], 0, safe.shape[0] - 1)
+    idx[:, 1] = np.clip(idx[:, 1], 0, safe.shape[1] - 1)
+    idx[:, 2] = np.clip(idx[:, 2], 0, safe.shape[2] - 1)
+    hits = safe[idx[:, 0], idx[:, 1], idx[:, 2]]
+    return float(np.mean(hits))
+
+# scoring utilities
+def segment_score(length: float, target_len: float, collision_rate: float,
+                  w_len: float = 0.6, w_collision: float = 0.4) -> float:
+    """
+    单段得分，组合距离接近度（越接近 target_len 越高）和 collision（越小越高）
+    返回 0..1
+    """
+    len_score = max(0.0, 1.0 - abs(length - target_len) / target_len)  # 1 when perfect
+    col_score = max(0.0, 1.0 - collision_rate)  # 1 when no collision
+    return w_len * len_score + w_collision * col_score
+
+# ---------- main algorithm ----------
+def plan_multi_support_sequences(
+    safe: np.ndarray,
+    start: np.ndarray,
+    goal: np.ndarray,
+    support_points: np.ndarray,
+    d_min: float = 250.0,
+    d_max: float = 350.0,
+    sample_step: float = 20.0,
+    target_len: float = 300.0,
+    max_hops: int = 4,
+    beam_width: int = 200,
+    top_k: int = 8
+) -> List[Dict[str, Any]]:
+    """
+    返回 top_k 条候选路径（每条为字典）
+    - 支架序列可以为空（直接 start->goal），但你可以在调用端过滤要求必须过规划栅格。
+    - max_hops: 支架数量上限（不含 start/goal）
+    - beam_width: BFS 每层保留的最优候选数（越大搜索越广但耗时越高）
+    """
+    # 合并节点数组：0=start, 1..N = support nodes, N+1 = goal
+    supports = np.asarray(support_points, dtype=float)
+    N = len(supports)
+    node_coords = [np.array(start, dtype=float)] + [supports[i] for i in range(N)] + [np.array(goal, dtype=float)]
+
+    idx_start = 0
+    idx_goal = N + 1
+
+    # 先构建邻接：只连满足距离约束的节点对（无方向）
+    adj = {i: [] for i in range(N + 2)}
+    for i in range(N + 2):
+        for j in range(i + 1, N + 2):
+            dist = euclid(node_coords[i], node_coords[j])
+            if d_min <= dist <= d_max:
+                adj[i].append(j)
+                adj[j].append(i)
+
+    # 如果 start/goal 没连上任何点，也可能直接连 start->goal （若符合距离）
+    # Beam-search state: (path_nodes_list, cumulative_score, cumulative_collision, last_node_id)
+    # we use negative score to make heapq a max-heap via min-heap invert
+    import math
+    initial_state = {
+        'nodes': [idx_start],
+        'score': 0.0,
+        'collisions': 0.0,
+        'lengths': [],
+    }
+    # beam: list of states
+    beam = [initial_state]
+    final_candidates = []
+
+    # BFS layers up to max_hops (hops count of supports); each expansion adds one support or connects to goal
+    for depth in range(max_hops + 1):
+        next_beam = []
+        for st in beam:
+            last = st['nodes'][-1]
+            # try to go directly to goal (only if edge exists)
+            if idx_goal in adj[last]:
+                # evaluate final path st['nodes'] + [goal]
+                path_nodes = st['nodes'] + [idx_goal]
+                # evaluate per-segment score & collision
+                total_score = 0.0
+                total_collision = 0.0
+                seg_details = []
+                valid = True
+                for a_i, b_i in zip(path_nodes[:-1], path_nodes[1:]):
+                    a = node_coords[a_i]; b = node_coords[b_i]
+                    seg_len = euclid(a, b)
+                    # sample points along seg
+                    pts = interpolate_line(a, b, step=sample_step)
+                    col_rate = static_collision_rate(safe, pts)
+                    s = segment_score(seg_len, target_len, col_rate)
+                    seg_details.append({'from': a_i, 'to': b_i, 'len': seg_len, 'col_rate': col_rate, 'seg_score': s})
+                    total_score += s
+                    total_collision += col_rate
+                    # optional: quick reject if collision too high (>0.9) for any seg
+                    if col_rate >= 0.95:
+                        valid = False
+                        break
+                if valid:
+                    # normalize total_score by number of segments for comparability
+                    nseg = len(path_nodes) - 1
+                    avg_score = total_score / max(1, nseg)
+                    avg_col = total_collision / max(1, nseg)
+                    final_candidates.append({
+                        'nodes': path_nodes,
+                        'avg_score': avg_score,
+                        'avg_collision': avg_col,
+                        'seg_details': seg_details
+                    })
+            # expand to neighbor support nodes (exclude goal) to extend path
+            for nb in adj[last]:
+                if nb == idx_goal or nb == idx_start:
+                    continue
+                if nb in st['nodes']:
+                    continue  # avoid cycles for now
+                # create new candidate by appending nb
+                # compute incremental segment score from last -> nb
+                a = node_coords[last]; b = node_coords[nb]
+                seg_len = euclid(a, b)
+                pts = interpolate_line(a, b, step=sample_step)
+                col_rate = static_collision_rate(safe, pts)
+                s = segment_score(seg_len, target_len, col_rate)
+                # quick prune: if collision extremely bad or len out of bounds (shouldn't happen), skip
+                if col_rate >= 0.98:
+                    continue
+                new_st = {
+                    'nodes': st['nodes'] + [nb],
+                    'score': st['score'] + s,
+                    'collisions': st['collisions'] + col_rate,
+                    'lengths': st['lengths'] + [seg_len]
+                }
+                next_beam.append(new_st)
+        if not next_beam:
+            break
+        # beam prune: keep top beam_width by (score per segment) heuristic
+        def beam_key(s):
+            # prefer higher average per-seg score and lower collisions and shorter path (less hops)
+            avg = s['score'] / max(1, len(s['lengths']))
+            return (avg, - (s['collisions'] / max(1, len(s['lengths']))), -len(s['nodes']))
+        next_beam.sort(key=beam_key, reverse=True)
+        beam = next_beam[:beam_width]
+
+    # final ranking of candidates
+    if not final_candidates:
+        return []
+
+    # compute combined ranking key: prefer avg_score then lower collision then fewer hops
+    def rank_key(c):
+        return (c['avg_score'], -c['avg_collision'], -len(c['nodes']))
+    final_candidates.sort(key=rank_key, reverse=True)
+    results = []
+    for c in final_candidates[:top_k]:
+        # decode node coords to real points
+        pts = [node_coords[i] for i in c['nodes']]
+        results.append({
+            'nodes': c['nodes'],
+            'points': np.array(pts),
+            'avg_score': c['avg_score'],
+            'avg_collision': c['avg_collision'],
+            'seg_details': c['seg_details']
+        })
+    return results
