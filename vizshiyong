@@ -1,0 +1,14 @@
+# safe: bool[X,Y,Z]  True = 障碍
+# support_points: (M,3)
+# start_vox / goal_vox: (3,)
+# routes: 来自 plan_multi_support_sequences 的返回
+
+visualize_routes_with_supports(
+    safe=safe,
+    support_points=support_points,
+    start=start_vox,
+    goal=goal_vox,
+    route_candidates=routes,   # plan_multi_support_sequences 返回
+    voxel_size=voxel_size_mm,  # 或者用 1.0 (若safe 已是mm坐标)
+    max_routes=5
+)
