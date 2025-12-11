@@ -1,0 +1,314 @@
+import numpy as np
+from typing import List, Dict, Any
+
+
+# ==========================================
+# 公共工具函数
+# ==========================================
+
+def euclid(a, b):
+    return float(np.linalg.norm(b - a))
+
+
+def interpolate_line(a, b, step):
+    v = b - a
+    dist = np.linalg.norm(v)
+    if dist < 1e-6:
+        return np.array([a])
+    n = int(dist / step)
+    if n < 1:
+        return np.array([a, b])
+    t = np.linspace(0, 1, n + 1)
+    return a[None, :] * (1 - t[:, None]) + b[None, :] * t[:, None]
+
+
+def static_collision_rate(safe: np.ndarray, pts: np.ndarray):
+    # safe: bool grid True=障碍
+    idx = np.clip(pts.round().astype(int), 0, np.array(safe.shape) - 1)
+    hits = safe[idx[:, 0], idx[:, 1], idx[:, 2]]
+    return np.mean(hits)
+
+
+def angle_score_between(v1, v2):
+    """你的原始角度评分逻辑仍然有效，用于 segment_score。"""
+    if np.linalg.norm(v1) < 1e-6 or np.linalg.norm(v2) < 1e-6:
+        return 0.0
+    v1n = v1 / np.linalg.norm(v1)
+    v2n = v2 / np.linalg.norm(v2)
+    cos_theta = np.clip(np.dot(v1n, v2n), -1, 1)
+    theta = np.arccos(cos_theta)  # 0~π
+    return 1.0 - theta / np.pi   # 越接近直线越高
+
+
+def segment_score(seg_len, target_len, col_rate, angle_s):
+    """原始综合评分"""
+    w_len = 0.5
+    w_col = 0.3
+    w_ang = 0.2
+    len_score = max(0, 1 - abs(seg_len - target_len) / target_len)
+    col_score = max(0, 1 - col_rate * 5)
+    return w_len * len_score + w_col * col_score + w_ang * angle_s
+
+
+# ==========================================
+# 新增：角度强制过滤函数
+# ==========================================
+
+def check_angle_chain(node_coords, path_nodes, start_dir, goal_dir, max_deg=90):
+    """整条路径检查所有夹角 ≤ 90°"""
+    max_rad = np.deg2rad(max_deg)
+    pts = [node_coords[i] for i in path_nodes]
+
+    # —— 中间段 ----
+    for i in range(1, len(pts) - 1):
+        a = pts[i - 1]
+        b = pts[i]
+        c = pts[i + 1]
+
+        v1 = b - a
+        v2 = c - b
+        if np.linalg.norm(v1) < 1e-6 or np.linalg.norm(v2) < 1e-6:
+            return False
+
+        cos_theta = np.dot(v1, v2) / (np.linalg.norm(v1)*np.linalg.norm(v2))
+        cos_theta = np.clip(cos_theta, -1, 1)
+        if np.arccos(cos_theta) > max_rad:
+            return False
+
+    # —— 第一段：start_dir 与第一段 ——
+    if len(pts) >= 2:
+        v = pts[1] - pts[0]
+        cos_theta = np.dot(start_dir, v) / (np.linalg.norm(start_dir)*np.linalg.norm(v))
+        cos_theta = np.clip(cos_theta, -1, 1)
+        if np.arccos(cos_theta) > max_rad:
+            return False
+
+    # —— 最后一段：最后一段与 goal_dir ——
+    if len(pts) >= 2:
+        v = pts[-1] - pts[-2]
+        cos_theta = np.dot(v, goal_dir) / (np.linalg.norm(v)*np.linalg.norm(goal_dir))
+        cos_theta = np.clip(cos_theta, -1, 1)
+        if np.arccos(cos_theta) > max_rad:
+            return False
+
+    return True
+
+
+def check_last_turn(node_coords, old_nodes, nb, start_dir, max_deg=90):
+    """Beam 扩展时检查新加入节点后最后一个夹角"""
+    max_rad = np.deg2rad(max_deg)
+
+    if len(old_nodes) == 1:
+        # 第一段：start_dir
+        a = node_coords[old_nodes[0]]
+        b = node_coords[nb]
+        v = b - a
+        cos_theta = np.dot(start_dir, v) / (np.linalg.norm(start_dir)*np.linalg.norm(v))
+        cos_theta = np.clip(cos_theta, -1, 1)
+        return np.arccos(cos_theta) <= max_rad
+
+    # 中间段
+    a = node_coords[old_nodes[-2]]
+    b = node_coords[old_nodes[-1]]
+    c = node_coords[nb]
+
+    v1 = b - a
+    v2 = c - b
+    cos_theta = np.dot(v1, v2) / (np.linalg.norm(v1)*np.linalg.norm(v2))
+    cos_theta = np.clip(cos_theta, -1, 1)
+    return np.arccos(cos_theta) <= max_rad
+
+
+# ==========================================
+# 主函数：整合角度过滤的最终版本
+# ==========================================
+
+def plan_multi_support_sequences(
+    safe: np.ndarray,
+    start: np.ndarray,
+    goal: np.ndarray,
+    support_points: np.ndarray,
+    start_dir: np.ndarray,
+    goal_dir: np.ndarray,
+    d_min: float = 250.0,
+    d_max: float = 350.0,
+    sample_step: float = 20.0,
+    target_len: float = 300.0,
+    max_hops: int = 4,
+    beam_width: int = 200,
+    top_k: int = 8
+) -> List[Dict[str, Any]]:
+
+    supports = np.asarray(support_points, dtype=float)
+    N = len(supports)
+
+    node_coords = [np.array(start, dtype=float)] \
+                  + [supports[i] for i in range(N)] \
+                  + [np.array(goal, dtype=float)]
+
+    idx_start = 0
+    idx_goal = N + 1
+
+    # ---------- adjacency based on distance ----------
+    adj = {i: [] for i in range(N + 2)}
+    for i in range(N + 2):
+        for j in range(i + 1, N + 2):
+            dist = euclid(node_coords[i], node_coords[j])
+            if d_min <= dist <= d_max:
+                adj[i].append(j)
+                adj[j].append(i)
+
+    # ---------- beam init ----------
+    beam = [{
+        "nodes": [idx_start],
+        "score": 0.0,
+        "collisions": 0.0,
+        "lengths": [],
+        "dirs": []
+    }]
+
+    final_candidates = []
+
+    # ============================================================
+    # beam search
+    # ============================================================
+    for depth in range(max_hops + 1):
+
+        next_beam = []
+
+        for st in beam:
+            last = st["nodes"][-1]
+
+            # ------ try reach goal ------
+            if idx_goal in adj[last]:
+                path_nodes = st["nodes"] + [idx_goal]
+
+                # === 新增：整条路径夹角过滤 ===
+                if not check_angle_chain(node_coords, path_nodes, start_dir, goal_dir):
+                    continue
+
+                seg_details = []
+                total_score = 0.0
+                total_collision = 0.0
+                valid = True
+
+                for k, (a_i, b_i) in enumerate(zip(path_nodes[:-1], path_nodes[1:])):
+                    a = node_coords[a_i]
+                    b = node_coords[b_i]
+                    seg_len = euclid(a, b)
+
+                    pts = interpolate_line(a, b, sample_step)
+                    col_rate = static_collision_rate(safe, pts)
+
+                    # angle_score 用于评分（非过滤）
+                    if k == 0:
+                        angle_s = angle_score_between(start_dir, b - a)
+                    elif b_i == idx_goal:
+                        angle_s = angle_score_between(b - a, goal_dir)
+                    else:
+                        prev_vec = node_coords[path_nodes[k]] - node_coords[path_nodes[k - 1]]
+                        curr_vec = b - a
+                        angle_s = angle_score_between(prev_vec, curr_vec)
+
+                    s = segment_score(seg_len, target_len, col_rate, angle_s)
+
+                    seg_details.append({
+                        "from": a_i, "to": b_i,
+                        "len": seg_len,
+                        "col_rate": col_rate,
+                        "angle_score": angle_s,
+                        "seg_score": s
+                    })
+
+                    total_score += s
+                    total_collision += col_rate
+
+                    if col_rate >= 0.1:
+                        valid = False
+                        break
+
+                if valid:
+                    nseg = len(path_nodes) - 1
+                    final_candidates.append({
+                        "nodes": path_nodes,
+                        "avg_score": total_score / nseg,
+                        "avg_collision": total_collision / nseg,
+                        "seg_details": seg_details
+                    })
+
+            # ------ expand to neighbor supports ------
+            for nb in adj[last]:
+                if nb in st["nodes"]:
+                    continue
+                if nb == idx_goal or nb == idx_start:
+                    continue
+
+                # === 新增：扩展前检查最后拐角是否 ≤ 90° ===
+                if not check_last_turn(node_coords, st["nodes"], nb, start_dir):
+                    continue
+
+                a = node_coords[last]
+                b = node_coords[nb]
+                seg_len = euclid(a, b)
+
+                pts = interpolate_line(a, b, sample_step)
+                col_rate = static_collision_rate(safe, pts)
+
+                if col_rate >= 0.1:
+                    continue
+
+                if len(st["nodes"]) == 1:
+                    angle_s = angle_score_between(start_dir, b - a)
+                else:
+                    prev_vec = a - node_coords[st["nodes"][-2]]
+                    curr_vec = b - a
+                    angle_s = angle_score_between(prev_vec, curr_vec)
+
+                s = segment_score(seg_len, target_len, col_rate, angle_s)
+
+                new_st = {
+                    "nodes": st["nodes"] + [nb],
+                    "score": st["score"] + s,
+                    "collisions": st["collisions"] + col_rate,
+                    "lengths": st["lengths"] + [seg_len],
+                    "dirs": st["dirs"] + [b - a]
+                }
+                next_beam.append(new_st)
+
+        if not next_beam:
+            break
+
+        # ---------- prune beam ----------
+        def beam_key(s):
+            avg_score = s["score"] / max(1, len(s["lengths"]))
+            avg_coll = s["collisions"] / max(1, len(s["lengths"]))
+            hops = len(s["nodes"])
+            return (avg_score, -avg_coll, -hops)
+
+        next_beam.sort(key=beam_key, reverse=True)
+        beam = next_beam[:beam_width]
+
+    # ============================================================
+    # final ranking
+    # ============================================================
+    if not final_candidates:
+        return []
+
+    def rank_key(c):
+        return (c["avg_score"], -c["avg_collision"], -len(c["nodes"]))
+
+    final_candidates.sort(key=rank_key, reverse=True)
+
+    # decode
+    results = []
+    for c in final_candidates[:top_k]:
+        pts = [node_coords[i] for i in c["nodes"]]
+        results.append({
+            'nodes': c['nodes'],
+            'points': np.array(pts),
+            'avg_score': c['avg_score'],
+            'avg_collision': c['avg_collision'],
+            'seg_details': c['seg_details']
+        })
+
+    return results
