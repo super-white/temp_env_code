@@ -1,0 +1,241 @@
+import numpy as np
+from typing import List, Dict, Any
+
+# ---------- basic utils ----------
+def euclid(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.linalg.norm(a - b))
+
+def interpolate_line(a: np.ndarray, b: np.ndarray, step: float = 10.0) -> np.ndarray:
+    """在 a->b 上均匀采点"""
+    a = np.array(a, dtype=float)
+    b = np.array(b, dtype=float)
+    L = euclid(a, b)
+    if L <= 1e-9:
+        return a.reshape(1, 3)
+    n = max(2, int(np.ceil(L / step)))
+    t = np.linspace(0.0, 1.0, n)
+    return a[None, :] + np.outer(t, (b - a))
+
+def static_collision_rate(safe: np.ndarray, pts: np.ndarray) -> float:
+    """统计 pts 中命中障碍体素的占比"""
+    if pts.size == 0:
+        return 0.0
+    idx = np.round(pts).astype(int)
+    idx[:, 0] = np.clip(idx[:, 0], 0, safe.shape[0] - 1)
+    idx[:, 1] = np.clip(idx[:, 1], 0, safe.shape[1] - 1)
+    idx[:, 2] = np.clip(idx[:, 2], 0, safe.shape[2] - 1)
+    hits = safe[idx[:, 0], idx[:, 1], idx[:, 2]]
+    return float(np.mean(hits))
+
+# ---------- angle utils ----------
+def angle_score_between(v1: np.ndarray, v2: np.ndarray) -> float:
+    """
+    计算 angle_score: (cosθ + 1) / 2
+    - 1：完全同向
+    - 0.5：90°
+    - 0：反向
+    """
+    n1 = np.linalg.norm(v1)
+    n2 = np.linalg.norm(v2)
+    if n1 < 1e-9 or n2 < 1e-9:
+        return 1.0  # 无方向时认为不扣分
+
+    v1 = v1 / n1
+    v2 = v2 / n2
+    cos_t = float(np.clip(np.dot(v1, v2), -1.0, 1.0))
+    return (cos_t + 1.0) / 2.0
+
+
+# ---------- segment score ----------
+def segment_score(seg_len: float,
+                  target_len: float,
+                  collision_rate: float,
+                  angle_score: float,
+                  w_len=0.5,
+                  w_collision=0.3,
+                  w_angle=0.2):
+    """
+    最终段评分：长度 + 碰撞 + 方向/曲率
+    """
+    len_score = max(0.0, 1.0 - abs(seg_len - target_len) / target_len)
+    col_score = max(0.0, 1.0 - collision_rate)
+    return (
+        w_len * len_score +
+        w_collision * col_score +
+        w_angle * angle_score
+    )
+
+
+# ---------- main planner ----------
+def plan_multi_support_sequences(
+    safe: np.ndarray,
+    start: np.ndarray,
+    goal: np.ndarray,
+    support_points: np.ndarray,
+    start_dir: np.ndarray,
+    goal_dir: np.ndarray,
+    d_min: float = 250.0,
+    d_max: float = 350.0,
+    sample_step: float = 20.0,
+    target_len: float = 300.0,
+    max_hops: int = 4,
+    beam_width: int = 200,
+    top_k: int = 8
+) -> List[Dict[str, Any]]:
+
+    supports = np.asarray(support_points, dtype=float)
+    N = len(supports)
+
+    node_coords = [np.array(start, dtype=float)] \
+                  + [supports[i] for i in range(N)] \
+                  + [np.array(goal, dtype=float)]
+
+    idx_start = 0
+    idx_goal = N + 1
+
+    # -------- build adjacency by distance constraints --------
+    adj = {i: [] for i in range(N + 2)}
+    for i in range(N + 2):
+        for j in range(i + 1, N + 2):
+            dist = euclid(node_coords[i], node_coords[j])
+            if d_min <= dist <= d_max:
+                adj[i].append(j)
+                adj[j].append(i)
+
+    # -------- beam search --------
+    beam = [{
+        "nodes": [idx_start],
+        "score": 0.0,
+        "collisions": 0.0,
+        "lengths": [],
+        "dirs": []  # 保存每段的方向向量
+    }]
+
+    final_candidates = []
+
+    for depth in range(max_hops + 1):
+
+        next_beam = []
+
+        for st in beam:
+            last = st["nodes"][-1]
+
+            # ---------- try go to goal ----------
+            if idx_goal in adj[last]:
+                path_nodes = st["nodes"] + [idx_goal]
+
+                seg_details = []
+                total_score = 0.0
+                total_collision = 0.0
+                valid = True
+
+                for k, (a_i, b_i) in enumerate(zip(path_nodes[:-1], path_nodes[1:])):
+                    a = node_coords[a_i]
+                    b = node_coords[b_i]
+                    seg_len = euclid(a, b)
+
+                    pts = interpolate_line(a, b, sample_step)
+                    col_rate = static_collision_rate(safe, pts)
+
+                    # ---------- angle score ----------
+                    if k == 0:  # 第1段
+                        angle_s = angle_score_between(start_dir, b - a)
+                    elif b_i == idx_goal:  # 最后一段
+                        angle_s = angle_score_between(b - a, goal_dir)
+                    else:
+                        prev_vec = node_coords[path_nodes[k]] - node_coords[path_nodes[k - 1]]
+                        curr_vec = b - a
+                        angle_s = angle_score_between(prev_vec, curr_vec)
+
+                    s = segment_score(seg_len, target_len, col_rate, angle_s)
+
+                    seg_details.append({
+                        "from": a_i, "to": b_i,
+                        "len": seg_len,
+                        "col_rate": col_rate,
+                        "angle_score": angle_s,
+                        "seg_score": s
+                    })
+
+                    total_score += s
+                    total_collision += col_rate
+
+                    if col_rate >= 0.95:
+                        valid = False
+                        break
+
+                if valid:
+                    nseg = len(path_nodes) - 1
+                    final_candidates.append({
+                        "nodes": path_nodes,
+                        "avg_score": total_score / nseg,
+                        "avg_collision": total_collision / nseg,
+                        "seg_details": seg_details
+                    })
+
+            # ---------- expand to neighbor supports ----------
+            for nb in adj[last]:
+                if nb == idx_goal or nb == idx_start:
+                    continue
+                if nb in st["nodes"]:
+                    continue
+
+                a = node_coords[last]
+                b = node_coords[nb]
+                seg_len = euclid(a, b)
+
+                pts = interpolate_line(a, b, sample_step)
+                col_rate = static_collision_rate(safe, pts)
+                if col_rate >= 0.98:
+                    continue
+
+                # ---------- angle score ----------
+                if len(st["nodes"]) == 1:
+                    # 第一段
+                    angle_s = angle_score_between(start_dir, b - a)
+                else:
+                    prev_vec = a - node_coords[st["nodes"][-2]]
+                    curr_vec = b - a
+                    angle_s = angle_score_between(prev_vec, curr_vec)
+
+                s = segment_score(seg_len, target_len, col_rate, angle_s)
+
+                new_st = {
+                    "nodes": st["nodes"] + [nb],
+                    "score": st["score"] + s,
+                    "collisions": st["collisions"] + col_rate,
+                    "lengths": st["lengths"] + [seg_len],
+                    "dirs": st["dirs"] + [b - a]
+                }
+                next_beam.append(new_st)
+
+        if not next_beam:
+            break
+
+        # ---------- prune beam ----------
+        def beam_key(s):
+            avg_score = s["score"] / max(1, len(s["lengths"]))
+            avg_coll = s["collisions"] / max(1, len(s["lengths"]))
+            hops = len(s["nodes"])
+            return (avg_score, -avg_coll, -hops)
+
+        next_beam.sort(key=beam_key, reverse=True)
+        beam = next_beam[:beam_width]
+
+    # ---------- final ranking ----------
+    if not final_candidates:
+        return []
+
+    def rank_key(c):
+        return (c["avg_score"], -c["avg_collision"], -len(c["nodes"]))
+
+    final_candidates.sort(key=rank_key, reverse=True)
+
+    # decode coords
+    results = []
+    for c in final_candidates[:top_k]:
+        pts = [node_coords[i] for i in c["nodes"]]
+        c["points"] = np.array(pts)
+        results.append(c)
+
+    return results
